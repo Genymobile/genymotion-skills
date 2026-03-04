@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Genymotion Device Web Player</title>
+
+    <!-- Genymotion Device Web Player styles -->
+    <link
+        rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/@genymotion/device-web-player@4.2.1/dist/css/device-renderer.min.css"
+    />
+
+    <style>
+        /* ── Genymotion player theme ── */
+        :root {
+            --gm-primary-color:              rgba(230, 25, 94, 1);
+            --gm-on-primary-color:           rgba(255, 255, 255, 1);
+            --gm-primary-variant-color:      rgba(230, 25, 94, 0.2);
+            --gm-on-primary-variant-color:   rgba(230, 25, 94, 1);
+            --gm-secondary-color:            #ffffff;
+            --gm-on-secondary-color:         #292929;
+            --gm-secondary-variant-color:    #f7f7ff;
+            --gm-on-secondary-variant-color: #1a1a1a;
+            --gm-tertiary-color:             #c4c4c44d;
+            --gm-on-tertiary-color:          #1a1a1a;
+            --gm-tertiary-variant-color:     #c4c4c4;
+            --gm-on-tertiary-variant-color:  #1a1a1a;
+            --gm-background-color:           #1a1a1a;
+            --gm-on-background-color:        #f0f0f0;
+            --gm-surface-color:              #222222;
+            --gm-on-surface-color:           #f0f0f0;
+            --gm-error-color:                rgba(255, 17, 17, 1);
+            --gm-background-error-color:     rgba(255, 17, 17, 0.1);
+            --gm-success-color:              rgba(17, 185, 32, 1);
+            --gm-background-success-color:   rgba(17, 185, 32, 0.1);
+            --gm-warning-color:              rgba(255, 204, 0, 1);
+            --gm-background-warning-color:   rgba(255, 204, 0, 0.1);
+            --gm-gradient-1:                 linear-gradient(142.33deg, #e6195e 4.58%, #2b41ea 122.31%);
+            --gm-on-gradient-1:              rgba(255, 255, 255, 1);
+            --gm-gradient-2:                 linear-gradient(275.69deg, #e6195e 10.31%, #2b41ea 136.09%);
+            --gm-on-gradient-2:              rgba(255, 255, 255, 1);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: #1a1a1a;
+            color: #f0f0f0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        header {
+            background-color: #111;
+            border-bottom: 1px solid #333;
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        header h1 {
+            font-size: 1rem;
+            font-weight: 600;
+            color: #e6195e;
+        }
+
+        #status-badge {
+            font-size: 0.75rem;
+            padding: 2px 10px;
+            border-radius: 12px;
+            background-color: #333;
+            color: #aaa;
+        }
+
+        #status-badge.connected {
+            background-color: #1a4a2e;
+            color: #4caf80;
+        }
+
+        #status-badge.error {
+            background-color: #4a1a1a;
+            color: #f44;
+        }
+
+        main {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+
+        #genymotion {
+            /* The player fills this container — adjust to your needs */
+            width: 400px;
+            height: 720px;
+            background-color: #000;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        #not-configured {
+            display: none;
+            flex-direction: column;
+            gap: 12px;
+            background-color: #1e1e1e;
+            border: 1px solid #444;
+            border-left: 4px solid #e6195e;
+            border-radius: 6px;
+            padding: 24px 28px;
+            max-width: 480px;
+            font-family: monospace;
+            font-size: 0.85rem;
+            color: #ccc;
+            line-height: 1.7;
+        }
+
+        #not-configured strong { color: #e6195e; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Genymotion Device Web Player</h1>
+        <span id="status-badge">disconnected</span>
+    </header>
+
+    <main>
+        <!-- Device player container -->
+        <div id="genymotion"></div>
+
+        <div id="not-configured">
+            <strong>Configuration required</strong>
+            Open this file in your editor and replace the two constants at the top of the &lt;script&gt;:<br />
+            &nbsp;&nbsp;<code>WEBRTC_ADDRESS</code> → the <code>webrtc_url</code> from the instance API<br />
+            &nbsp;&nbsp;<code>ACCESS_TOKEN</code> &nbsp;&nbsp;→ the access token from the instances/access-token API<br />
+            Then reload the page.
+        </div>
+    </main>
+
+    <!-- Genymotion Device Web Player script -->
+    <script src="https://cdn.jsdelivr.net/npm/@genymotion/device-web-player@4.2.1/dist/js/device-renderer.min.js"></script>
+    <script>
+        // ─────────────────────────────────────────────────────────────────────
+        //  Configuration
+        //  Replace these two values, or leave them as-is to use the form below.
+        // ─────────────────────────────────────────────────────────────────────
+        const WEBRTC_ADDRESS = 'REPLACE_WITH_WSS_ADDRESS'; // e.g. 'wss://1.2.3.4'
+        const ACCESS_TOKEN     = 'REPLACE_WITH_ACCESS_TOKEN';  
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  Player options — customise as needed
+        // ─────────────────────────────────────────────────────────────────────
+        const PLAYER_OPTIONS = {
+            showPhoneBorder: true,
+            toolbarPosition: 'right',   // 'left' | 'right'
+            floatingToolbar: true,
+
+            // Uncomment to disable unused plugins:
+            // microphone: false,
+            // gamepad: false,
+            // phone: false,
+        };
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  Internal logic — no need to edit below
+        // ─────────────────────────────────────────────────────────────────────
+        const statusBadge    = document.getElementById('status-badge');
+        const container      = document.getElementById('genymotion');
+        const notConfigured  = document.getElementById('not-configured');
+
+        let rendererAPI = null;
+
+        function setStatus(label, cssClass) {
+            statusBadge.textContent = label;
+            statusBadge.className   = cssClass || '';
+        }
+
+        function isPlaceholder(v) { return !v || v.startsWith('REPLACE_WITH'); }
+
+        if (isPlaceholder(WEBRTC_ADDRESS) || isPlaceholder(ACCESS_TOKEN)) {
+            container.style.display     = 'none';
+            notConfigured.style.display = 'flex';
+            setStatus('not configured', '');
+        } else {
+            setStatus('connecting…', '');
+            const { DeviceRendererFactory } = window.genyDeviceWebPlayer;
+            try {
+                rendererAPI = new DeviceRendererFactory().setupRenderer(
+                    container, WEBRTC_ADDRESS, { ...PLAYER_OPTIONS, token: ACCESS_TOKEN }
+                );
+                setStatus('connected', 'connected');
+            } catch (err) {
+                console.error('Failed to start player:', err);
+                setStatus('error', 'error');
+            }
+        }
+
+        window.addEventListener('beforeunload', () => { if (rendererAPI) rendererAPI.disconnect(); });
+    </script>
+</body>
+</html>

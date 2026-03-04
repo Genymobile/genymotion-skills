@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Genymotion Device Player</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Bangers&family=Nunito:wght@700;900&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@genymotion/device-web-player@4.2.1/dist/css/device-renderer.min.css" />
+
+    <style>
+        :root {
+            /* ── Genymotion player theme — Subway Surfers ── */
+            --gm-primary-color:              #ff6b00;
+            --gm-on-primary-color:           #ffffff;
+            --gm-primary-variant-color:      rgba(255, 107, 0, 0.2);
+            --gm-on-primary-variant-color:   #ff6b00;
+            --gm-secondary-color:            #7c2bff;
+            --gm-on-secondary-color:         #ffffff;
+            --gm-secondary-variant-color:    rgba(124, 43, 255, 0.2);
+            --gm-on-secondary-variant-color: #7c2bff;
+            --gm-tertiary-color:             rgba(255, 45, 120, 0.2);
+            --gm-on-tertiary-color:          #ff2d78;
+            --gm-tertiary-variant-color:     #ff2d78;
+            --gm-on-tertiary-variant-color:  #ffffff;
+            --gm-background-color:           #1a0533;
+            --gm-on-background-color:        #ffffff;
+            --gm-surface-color:              rgba(255, 255, 255, 0.07);
+            --gm-on-surface-color:           #ffffff;
+            --gm-error-color:                #ff2d78;
+            --gm-background-error-color:     rgba(255, 45, 120, 0.1);
+            --gm-success-color:              #00e676;
+            --gm-background-success-color:   rgba(0, 230, 118, 0.1);
+            --gm-warning-color:              #ffe000;
+            --gm-background-warning-color:   rgba(255, 224, 0, 0.1);
+            --gm-gradient-1:                 linear-gradient(142.33deg, #ff6b00 4.58%, #7c2bff 122.31%);
+            --gm-on-gradient-1:              rgba(255, 255, 255, 1);
+            --gm-gradient-2:                 linear-gradient(275.69deg, #ff2d78 10.31%, #7c2bff 136.09%);
+            --gm-on-gradient-2:              rgba(255, 255, 255, 1);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            font-family: 'Nunito', sans-serif;
+            background: var(--gm-background-color);
+            background-image:
+                radial-gradient(ellipse at top left, var(--gm-secondary-variant-color) 0%, transparent 50%),
+                radial-gradient(ellipse at bottom right, var(--gm-primary-variant-color) 0%, transparent 50%);
+            overflow-x: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image:
+                radial-gradient(circle at 10% 80%, var(--gm-tertiary-color) 0%, transparent 30%),
+                radial-gradient(circle at 90% 20%, var(--gm-background-success-color) 0%, transparent 25%);
+            pointer-events: none;
+        }
+
+        /* floating dots */
+        .dots {
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            overflow: hidden;
+            z-index: 0;
+        }
+
+        .dot {
+            position: absolute;
+            border-radius: 50%;
+            opacity: 0.22;
+            animation: float linear infinite;
+        }
+
+        @keyframes float {
+            from { transform: translateY(100vh) rotate(0deg); }
+            to   { transform: translateY(-120px) rotate(720deg); }
+        }
+
+        /* ── HEADER ── */
+        header {
+            position: relative;
+            z-index: 10;
+            padding: 0 32px;
+            height: 70px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            background: rgba(0, 0, 0, 0.35);
+            backdrop-filter: blur(8px);
+            border-bottom: 3px solid transparent;
+            border-image: var(--gm-gradient-1) 1;
+        }
+
+        .logo-text {
+            font-family: 'Bangers', cursive;
+            font-size: 2rem;
+            letter-spacing: 3px;
+            background: var(--gm-gradient-1);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            filter: drop-shadow(0 2px 6px var(--gm-primary-variant-color));
+            text-transform: uppercase;
+        }
+
+        .logo-tag {
+            font-size: 0.65rem;
+            font-weight: 900;
+            color: var(--gm-success-color);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            background: var(--gm-background-success-color);
+            border: 1px solid var(--gm-success-color);
+            border-radius: 4px;
+            padding: 2px 8px;
+        }
+
+        #status-badge {
+            margin-left: auto;
+            font-size: 0.7rem;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            padding: 4px 14px;
+            border-radius: 20px;
+            border: 2px solid rgba(255, 255, 255, 0.15);
+            color: rgba(255, 255, 255, 0.35);
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        #status-badge.connected {
+            background: var(--gm-background-success-color);
+            border-color: var(--gm-success-color);
+            color: var(--gm-success-color);
+            animation: pulse-success 2s ease-in-out infinite;
+        }
+
+        #status-badge.error {
+            background: var(--gm-background-error-color);
+            border-color: var(--gm-error-color);
+            color: var(--gm-error-color);
+        }
+
+        @keyframes pulse-success {
+            0%, 100% { box-shadow: 0 0 10px var(--gm-background-success-color); }
+            50%       { box-shadow: 0 0 22px var(--gm-success-color); }
+        }
+
+        /* ── MAIN ── */
+        main {
+            position: relative;
+            z-index: 10;
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 40px;
+            gap: 40px;
+        }
+
+        /* device frame */
+        .device-frame {
+            position: relative;
+            padding: 10px;
+            border-radius: 28px;
+            background: var(--gm-gradient-1);
+            box-shadow:
+                0 0 0 3px rgba(255, 255, 255, 0.08),
+                0 20px 60px rgba(0, 0, 0, 0.6),
+                0 0 80px var(--gm-secondary-variant-color);
+            animation: device-bob 4s ease-in-out infinite;
+        }
+
+        @keyframes device-bob {
+            0%, 100% { transform: translateY(0px) rotate(-0.5deg); }
+            50%       { transform: translateY(-8px) rotate(0.5deg); }
+        }
+
+        .device-frame::before {
+            content: '';
+            position: absolute;
+            inset: 2px;
+            border-radius: 26px;
+            background: rgba(0, 0, 0, 0.55);
+            z-index: -1;
+        }
+
+        /* stickers */
+        .sticker {
+            position: absolute;
+            font-family: 'Bangers', cursive;
+            font-size: 0.9rem;
+            letter-spacing: 1px;
+            padding: 3px 8px;
+            border-radius: 4px;
+            pointer-events: none;
+            box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.5);
+            z-index: 20;
+        }
+
+        .sticker-1 {
+            background: var(--gm-warning-color);
+            color: var(--gm-background-color);
+            top: -12px; left: 20px;
+            transform: rotate(-6deg);
+        }
+
+        .sticker-2 {
+            background: var(--gm-error-color);
+            color: var(--gm-on-primary-color);
+            bottom: 30px; right: -18px;
+            transform: rotate(8deg);
+            font-size: 0.75rem;
+        }
+
+        .sticker-3 {
+            background: var(--gm-success-color);
+            color: var(--gm-background-color);
+            top: 40px; left: -22px;
+            transform: rotate(-12deg);
+            font-size: 0.7rem;
+        }
+
+        #genymotion {
+            width: 380px;
+            height: 690px;
+            background: #000;
+            border-radius: 18px;
+            overflow: hidden;
+            display: block;
+        }
+
+        /* ── NOT CONFIGURED ── */
+        #not-configured {
+            display: none;
+            flex-direction: column;
+            gap: 14px;
+            background: var(--gm-surface-color);
+            border: 2px solid var(--gm-primary-variant-color);
+            border-radius: 16px;
+            padding: 28px;
+            max-width: 400px;
+            backdrop-filter: blur(10px);
+        }
+
+        #not-configured strong {
+            font-family: 'Bangers', cursive;
+            font-size: 1.4rem;
+            letter-spacing: 2px;
+            background: var(--gm-gradient-1);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        #not-configured p {
+            font-size: 0.82rem;
+            color: var(--gm-on-surface-color);
+            opacity: 0.65;
+            line-height: 1.7;
+        }
+
+        #not-configured code {
+            font-family: monospace;
+            font-size: 0.8rem;
+            color: var(--gm-warning-color);
+            background: var(--gm-background-warning-color);
+            padding: 1px 5px;
+            border-radius: 3px;
+        }
+
+        /* ── FOOTER ── */
+        footer {
+            position: relative;
+            z-index: 10;
+            padding: 10px 32px;
+            text-align: center;
+            font-size: 0.65rem;
+            font-weight: 700;
+            color: var(--gm-on-background-color);
+            opacity: 0.2;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            border-top: 1px solid var(--gm-surface-color);
+        }
+    </style>
+</head>
+<body>
+    <div class="dots" aria-hidden="true">
+        <div class="dot" style="background:var(--gm-primary-color);   left:5%;  animation-duration:8s; animation-delay:0s;   width:12px;height:12px;"></div>
+        <div class="dot" style="background:var(--gm-warning-color);   left:15%; animation-duration:11s;animation-delay:2s;   width:8px; height:8px;"></div>
+        <div class="dot" style="background:var(--gm-secondary-color); left:30%; animation-duration:9s; animation-delay:4s;   width:16px;height:16px;"></div>
+        <div class="dot" style="background:var(--gm-error-color);     left:50%; animation-duration:13s;animation-delay:1s;   width:10px;height:10px;"></div>
+        <div class="dot" style="background:var(--gm-success-color);   left:70%; animation-duration:7s; animation-delay:3s;   width:6px; height:6px;"></div>
+        <div class="dot" style="background:var(--gm-primary-color);   left:85%; animation-duration:10s;animation-delay:5s;   width:14px;height:14px;"></div>
+        <div class="dot" style="background:var(--gm-warning-color);   left:92%; animation-duration:12s;animation-delay:0.5s; width:9px; height:9px;"></div>
+    </div>
+
+    <header>
+        <span class="logo-text">Genymotion</span>
+        <span class="logo-tag">Live</span>
+        <span id="status-badge">Offline</span>
+    </header>
+
+    <main>
+        <div class="device-frame">
+            <div class="sticker sticker-1">ANDROID</div>
+            <div class="sticker sticker-2">LIVE!</div>
+            <div class="sticker sticker-3">CLOUD</div>
+            <div id="genymotion"></div>
+        </div>
+
+        <div id="not-configured">
+            <strong>Setup Required!</strong>
+            <p>
+                Open this file in your editor and replace the two constants at the top of the &lt;script&gt;:<br />
+                &nbsp;&nbsp;<code>WEBRTC_ADDRESS</code> → <code>webrtc_url</code> from the instance API<br />
+                &nbsp;&nbsp;<code>ACCESS_TOKEN</code> &nbsp;&nbsp;→ token from the instances/access-token API<br />
+                Then reload the page.
+            </p>
+        </div>
+    </main>
+
+    <footer>Genymotion Cloud &mdash; device-web-player</footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/@genymotion/device-web-player@4.2.1/dist/js/device-renderer.min.js"></script>
+    <script>
+        // ── Configuration — edit these two values ──────────────────────────────
+        const WEBRTC_ADDRESS = 'REPLACE_WITH_WSS_ADDRESS'; // e.g. 'wss://1.2.3.4'
+        const ACCESS_TOKEN     = 'REPLACE_WITH_ACCESS_TOKEN';
+
+        const PLAYER_OPTIONS = {
+            showPhoneBorder: false,
+            toolbarPosition: 'right',
+            floatingToolbar: false,
+        };
+        // ───────────────────────────────────────────────────────────────────────
+
+        const statusBadge   = document.getElementById('status-badge');
+        const deviceFrame   = document.querySelector('.device-frame');
+        const container     = document.getElementById('genymotion');
+        const notConfigured = document.getElementById('not-configured');
+
+        let rendererAPI = null;
+
+        function setStatus(label, cssClass) {
+            statusBadge.textContent = label;
+            statusBadge.className   = cssClass || '';
+        }
+
+        function isPlaceholder(v) { return !v || v.startsWith('REPLACE_WITH'); }
+
+        if (isPlaceholder(WEBRTC_ADDRESS) || isPlaceholder(ACCESS_TOKEN)) {
+            deviceFrame.style.display   = 'none';
+            notConfigured.style.display = 'flex';
+            setStatus('Offline', '');
+        } else {
+            setStatus('Connecting…', '');
+            const { DeviceRendererFactory } = window.genyDeviceWebPlayer;
+            try {
+                rendererAPI = new DeviceRendererFactory().setupRenderer(
+                    container, WEBRTC_ADDRESS, { ...PLAYER_OPTIONS, token: ACCESS_TOKEN }
+                );
+                setStatus('Live!', 'connected');
+            } catch (err) {
+                console.error(err);
+                setStatus('Error', 'error');
+            }
+        }
+
+        window.addEventListener('beforeunload', () => { if (rendererAPI) rendererAPI.disconnect(); });
+    </script>
+</body>
+</html>
