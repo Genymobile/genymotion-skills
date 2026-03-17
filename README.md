@@ -16,13 +16,23 @@ Each skill contains:
 ### Skill structure in this repository
 
 ```
-SKILL.md                          ← Main skill entry point
-gmsaas-reference.md               ← Cloud/SaaS command reference
-gmtool-reference.md               ← Desktop command reference
-device-web-player-reference.md    ← Web player SDK reference
-github-actions-reference.md       ← CI/CD integration reference
-cicd-reference.md                 ← Generic CI/CD reference
-templates/                        ← Ready-to-use HTML templates
+SKILL.md                                        ← Main skill entry point
+references/
+├── gmsaas-reference.md                         ← Cloud/SaaS command reference
+├── gmtool-reference.md                         ← Desktop command reference
+├── device-web-player-reference.md              ← Web player SDK reference
+├── setup-gmsaas.md                             ← gmsaas installation guide
+├── setup-gmtool.md                             ← gmtool installation guide
+└── cicd-reference.md                           ← CI/CD integration resources
+templates/                                      ← Ready-to-use HTML templates
+```
+
+---
+
+## Quick Install
+
+```bash
+npx skills add Genymobile/genymotion-skills
 ```
 
 ---
@@ -98,7 +108,7 @@ follow the instructions in `.github/instructions/genymotion/SKILL.md`.
 
 ### Android Studio (Gemini)
 
-Android Studio's Gemini assistant can use project-level context files.
+Android Studio's Gemini assistant uses `AGENTS.md` files for project-level context.
 
 1. Place the skill files in your project:
 
@@ -106,7 +116,7 @@ Android Studio's Gemini assistant can use project-level context files.
 git clone https://github.com/Genymobile/genymotion-skills .gemini/skills/genymotion
 ```
 
-2. Create or update `.gemini/GEMINI.md` to reference the skill:
+2. Create or update `AGENTS.md` at your project root:
 
 ```markdown
 ## Genymotion Skill
@@ -116,7 +126,7 @@ or anything related to emulator management, read and follow the instructions in
 `.gemini/skills/genymotion/SKILL.md`.
 ```
 
-> **Note**: Gemini context file support varies by Android Studio version. Check the Gemini plugin documentation for the exact context file name and location supported by your version.
+Gemini automatically picks up `AGENTS.md` files from the current directory and its parents.
 
 ---
 
@@ -145,38 +155,31 @@ read and follow the instructions in `.cursor/skills/genymotion/SKILL.md`.
 
 ---
 
-### Windsurf
-
-Windsurf uses a `.windsurfrules` file at the project root.
-
-1. Clone the skill files:
-
-```bash
-git clone https://github.com/Genymobile/genymotion-skills .windsurf/skills/genymotion
-```
-
-2. Add to `.windsurfrules`:
-
-```markdown
-## Genymotion Skill
-
-When the user asks about Android virtual devices, Genymotion, gmsaas, or gmtool,
-read and follow the instructions in `.windsurf/skills/genymotion/SKILL.md`.
-```
-
----
 
 ## What the Skill Covers
 
 | Topic | Tool |
 |---|---|
 | Start / stop / list cloud instances | `gmsaas` |
-| Flash, install APK, run ADB on cloud | `gmsaas` |
+| Install APK, run ADB on cloud | `gmsaas` |
+| Flash a device archive | `gmtool` |
 | Create / start / stop local virtual devices | `gmtool` |
 | Install APK, run ADB on local devices | `gmtool` |
-| Display a cloud instance in the Desktop player | `gmsaas` + `player` |
+| Display a cloud instance (browser or gmsaas display) | `gmsaas` |
 | Embed a cloud instance in a web page | `device-web-player` SDK |
-| CI/CD integration (GitHub Actions, etc.) | `gmsaas` |
+| CI/CD integration (GitHub Actions, Jenkins, Bitrise, CircleCI…) | `gmsaas` only |
+
+---
+
+## CI/CD Integration
+
+CI/CD is supported with **Genymotion SaaS** (`gmsaas`) only — not Genymotion Desktop. The skill covers the general pattern (auth → start instance → adbconnect → run tests → stop instance) and points to official resources.
+
+- [Jenkins + Genymotion SaaS](https://www.genymotion.com/blog/tutorial/jenkins-genymotion-saas/)
+- [Bitrise + Genymotion SaaS](https://www.genymotion.com/blog/tutorial/bitrise-genymotion-saas/)
+- [CircleCI + Genymotion SaaS](https://www.genymotion.com/blog/tutorial/auto-tests-circelci-genymotion-saas/)
+- [GitHub Actions — Genymotion SaaS Action](https://github.com/marketplace/actions/genymotion-saas-action)
+- [React Native + Detox + Genymotion SaaS](https://www.genymotion.com/blog/tutorial/react_native_detox_genymotion_saas/)
 
 ---
 
@@ -184,8 +187,8 @@ read and follow the instructions in `.windsurf/skills/genymotion/SKILL.md`.
 
 | Tool | Install |
 |---|---|
-| `gmsaas` | `pip install gmsaas` — [Genymotion SaaS account](https://cloud.geny.io) required |
-| `gmtool` | Bundled with [Genymotion Desktop](https://www.genymotion.com/product-desktop/) |
+| `gmsaas` | `pip install gmsaas` — [Genymotion SaaS account](https://cloud.geny.io) required — see `references/setup-gmsaas.md` |
+| `gmtool` | Bundled with [Genymotion Desktop](https://www.genymotion.com/product-desktop/) — see `references/setup-gmtool.md` |
 
 ---
 
