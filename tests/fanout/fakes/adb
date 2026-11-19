@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Fake adb for the offline tests of scripts/fanout.sh.
+# "adb devices" prints the real header, then one "<serial><TAB><state>" line per
+# fake instance whose ADB tunnel is connected (state "offline" for the
+# "adboffline" behaviour, "device" otherwise).
+# Knob: FAKE_ADB_NEEDS_START=1 prints no device until "gmsaas adb start" ran.
+set -euo pipefail
+
+: "${FAKE_GMSAAS_DIR:?FAKE_GMSAAS_DIR must point to the fake state directory}"
+printf '%s\n' "$*" >>"$FAKE_GMSAAS_DIR/adb_calls.log"
+
+case "${1:-}" in
+  devices)
+    echo "List of devices attached"
+    if [ "${FAKE_ADB_NEEDS_START:-}" = "1" ] && [ ! -e "$FAKE_GMSAAS_DIR/adb_started" ]; then
+      echo
+      exit 0
+    fi
+    for f in "$FAKE_GMSAAS_DIR"/instances/*.json; do
+      [ -e "$f" ] || continue
+      jq -r 'select(.adbtunnel_state == "CONNECTED")
+        | "\(.adb_serial)\t\(if ._behaviour == "adboffline" then "offline" else "device" end)"' "$f"
+    done
+    echo
+    ;;
+  *)
+    exit 0
+    ;;
+esac

@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# Fake gmsaas for the offline tests of scripts/fanout.sh.
+# It never touches the network. It reproduces the shapes of gmsaas 1.16.0 with
+# "--format compactjson": one JSON object on stdout on success; on an API or
+# configuration failure an empty stdout, a JSON error object on stderr and the
+# gmsaas exit code; on a usage error (click) plain text on stderr and exit 2.
+#
+# State lives in "$FAKE_GMSAAS_DIR" (required):
+#   instances/<uuid>.json   one file per fake instance (keys starting with "_" are private)
+#   calls.log               argv of every invocation, one line each
+#   adb_started             created by "gmsaas adb start"
+#   probe.log               written by the FAKE_GMSAAS_STDERR_PROBE knob
+#
+# Knobs (environment variables):
+#   FAKE_GMSAAS_AUTH_FAIL=1          every command fails with AUTHENTICATION_ERROR (exit 3): token rejected
+#   FAKE_GMSAAS_NO_AUTH=1            every command fails with CONFIGURATION_ERROR (exit 6): no authentication set
+#   FAKE_GMSAAS_LIST_USAGE_ERROR=1   "instances list" fails with a plain-text usage error (exit 2)
+#   FAKE_GMSAAS_BEHAVIOUR_<index>    behaviour of the instance whose name ends in -<index>:
+#       normal             CREATING -> STARTING -> BOOTING -> ONLINE over successive list calls
+#       slow               CREATING -> STARTING -> BOOTING, never ONLINE
+#       fail               CREATING -> STARTING -> ERROR
+#       vanish             CREATING -> STARTING, then no longer listed
+#       startfail          the start call fails with API_ERROR (exit 4), nothing is created
+#       startfail_created  the instance is created, but the start call still fails (exit 4)
+#       adboffline         boots normally; adb shows its serial as "offline"
+#       stuckstop          boots normally; once stopped it stays STOPPING forever
+#   FAKE_GMSAAS_START_DELAY_<index>  seconds the start call sleeps after creating the instance
+#   FAKE_GMSAAS_CREATE_DELAY_<index> the "server" creates the instance this many seconds after the
+#                                    start call began, even when the client is killed meanwhile
+#   FAKE_GMSAAS_HIDE_LISTS_<index>=N the instance is missing from the first N list calls after its creation
+#   FAKE_GMSAAS_STOP_FAIL_ONCE_<index>=1  the first stop call on the instance fails with API_ERROR (exit 4)
+#   FAKE_GMSAAS_STOP_LISTS_<index>=N once stopped, the instance stays listed as STOPPING for N list calls (default 1)
+#   FAKE_GMSAAS_BUSY_PORTS="p1 p2"   adbconnect on these ports fails with ADBTUNNEL_BUSY_PORT_ERROR (exit 11)
+#   FAKE_GMSAAS_ADBCONNECT_DELAY=S   adbconnect sleeps S seconds before answering
+#   FAKE_GMSAAS_ADB_ALREADY_<index>=P  the instance is already connected on port P: adbconnect on any
+#                                    other port fails with ADBTUNNEL_DIFFERENT_PORT_ERROR (exit 13)
+#   FAKE_GMSAAS_ADB_TIMEOUT_<index>=1  adbconnect fails with ADBTUNNEL_TIMEOUT_ERROR (exit 12)
+#   FAKE_GMSAAS_SDK_PATH=<path>      value of "config get android-sdk-path" (default: empty)
+#   FAKE_GMSAAS_LOCK_AFTER_LISTS="<n>:<dir>"  after the n-th list call, chmod 555 <dir>
+#   FAKE_GMSAAS_STDERR_PROBE=<file>  on each "instances start", append "run-id-before-start=yes|no" to
+#                                    probe.log: whether <file> (the caller's captured stderr) already
+#                                    holds the "fanout: run <run-id> (stop it with: ...)" line
+set -euo pipefail
+
+: "${FAKE_GMSAAS_DIR:?FAKE_GMSAAS_DIR must point to the fake state directory}"
+INST_DIR="$FAKE_GMSAAS_DIR/instances"
+mkdir -p "$INST_DIR"
+printf '%s\n' "$*" >>"$FAKE_GMSAAS_DIR/calls.log"
+
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+fail() { # code desc message
+  jq -cn --arg m "$3" --argjson c "$1" --arg d "$2" \
+    '{error: {message: $m, details: ""}, exit_code: $c, exit_code_desc: $d}' >&2
+  exit "$1"
+}
+
+usage_fail() { # command message: click prints plain text, not JSON
+  printf 'Usage: gmsaas %s [OPTIONS]\nTry '"'"'gmsaas %s -h'"'"' for help.\n\nError: %s\n' "$1" "$1" "$2" >&2
+  exit 2
+}
+
+ok() { # extra-json-object
+  jq -c '. + {exit_code: 0, exit_code_desc: "NO_ERROR"}' <<<"$1"
+}
+
+public() { # instance file -> public instance object
+  jq -c 'with_entries(select(.key | startswith("_") | not))' "$1"
+}
+
+save() { # file json
+  local tmp="$1.tmp"
+  printf '%s\n' "$2" >"$tmp"
+  mv -f "$tmp" "$1"
+}
+
+index_of() { # name -> index suffix, or empty
+  local idx="${1##*-}"
+  if [[ "$idx" =~ ^[0-9]+$ ]]; then printf '%s' "$idx"; fi
+}
+
+knob() { # base-name index -> value of <base-name>_<index>, or empty
+  local var="${1}_${2}"
+  [ -n "$2" ] || return 0
+  printf '%s' "${!var:-}"
+}
+
+if [ "${1:-}" != "--format" ] || [ "${2:-}" != "compactjson" ]; then
+  # The real gmsaas prints a text table here; the fake prints text that is not JSON.
+  echo "fake gmsaas: text output (call with --format compactjson)"
+  exit 0
+fi
+shift 2
+
+if [ "${FAKE_GMSAAS_AUTH_FAIL:-}" = "1" ]; then
+  fail 3 AUTHENTICATION_ERROR "Authentication failed: the API token is invalid"
+fi
+if [ "${FAKE_GMSAAS_NO_AUTH:-}" = "1" ]; then
+  fail 6 CONFIGURATION_ERROR "No authentication set: run 'gmsaas auth token' first"
+fi
+
+cmd="${1:-} ${2:-}"
+shift 2 || true
+
+case "$cmd" in
+  "instances start")
+    no_wait=0 duration="" positional=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --no-wait) no_wait=1; shift ;;
+        --max-run-duration)
+          [ $# -ge 2 ] || usage_fail "instances start" "Option '--max-run-duration' requires an argument."
+          duration="$2"; shift 2 ;;
+        -*) usage_fail "instances start" "No such option: $1" ;;
+        *) positional+=("$1"); shift ;;
+      esac
+    done
+    [ "${#positional[@]}" -eq 2 ] || usage_fail "instances start" "Expected RECIPE_UUID and INSTANCE_NAME"
+    recipe="${positional[0]}" name="${positional[1]}"
+    [[ "$recipe" =~ $UUID_RE ]] || usage_fail "instances start" "Invalid value for 'RECIPE_UUID': '$recipe' is not a valid UUID."
+    if [ -n "$duration" ]; then
+      [[ "$duration" =~ ^[0-9]+$ ]] && [ "$duration" -le 28800 ] ||
+        usage_fail "instances start" "Invalid value for '--max-run-duration': $duration is not in the range 0<=x<=28800."
+    fi
+    if [ -n "${FAKE_GMSAAS_STDERR_PROBE:-}" ]; then
+      if grep -Eq '^fanout: run [0-9]{14}-[0-9a-f]{8} \(stop it with: fanout\.sh stop --run [0-9]{14}-[0-9a-f]{8}\)$' \
+        "$FAKE_GMSAAS_STDERR_PROBE" 2>/dev/null; then
+        echo "run-id-before-start=yes" >>"$FAKE_GMSAAS_DIR/probe.log"
+      else
+        echo "run-id-before-start=no" >>"$FAKE_GMSAAS_DIR/probe.log"
+      fi
+    fi
+    idx="$(index_of "$name")"
+    beh="$(knob FAKE_GMSAAS_BEHAVIOUR "$idx")"; beh="${beh:-normal}"
+    if [ "$beh" = "startfail" ]; then fail 4 API_ERROR "Quota reached: no more instances can be started"; fi
+    n=$(( $(cat "$FAKE_GMSAAS_DIR/seq" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" >"$FAKE_GMSAAS_DIR/seq"
+    uuid="$(printf '00000000-0000-4000-8000-%012d' "$n")"
+    state=CREATING lists=0
+    if [ "$no_wait" -eq 0 ]; then state=ONLINE lists=3; fi
+    hide="$(knob FAKE_GMSAAS_HIDE_LISTS "$idx")"
+    stop_lists="$(knob FAKE_GMSAAS_STOP_LISTS "$idx")"
+    stop_fail="$(knob FAKE_GMSAAS_STOP_FAIL_ONCE "$idx")"
+    already="$(knob FAKE_GMSAAS_ADB_ALREADY "$idx")"
+    adb_timeout="$(knob FAKE_GMSAAS_ADB_TIMEOUT "$idx")"
+    inst="$(jq -cn --arg u "$uuid" --arg n "$name" --arg r "$recipe" --arg s "$state" \
+      --arg b "$beh" --argjson l "$lists" --arg d "${duration:-0}" --argjson h "${hide:-0}" \
+      --argjson sl "${stop_lists:-1}" --arg sf "${stop_fail:-}" --arg al "${already:-}" --arg at "${adb_timeout:-}" '{
+        uuid: $u, name: $n, created_at: "2026-11-18T17:16:00+00:00",
+        max_run_duration: ($d | tonumber), max_inactivity_duration: 0, state: $s,
+        adbtunnel_state: "DISCONNECTED", adb_serial: "0.0.0.0", adb_serial_port: 0,
+        recipe: {uuid: $r, name: "Fake recipe"},
+        _behaviour: $b, _lists: $l, _hide: $h, _seen: 0, _stopped: false, _stop_lists: 0,
+        _stop_lists_max: $sl, _stop_fail_once: ($sf == "1"), _adb_already: $al, _adb_timeout: ($at == "1")}')"
+    create_delay="$(knob FAKE_GMSAAS_CREATE_DELAY "$idx")"
+    if [ -n "$create_delay" ]; then
+      # Server side: the creation goes on even if this client process is killed.
+      (sleep "$create_delay"; save "$INST_DIR/$uuid.json" "$inst") </dev/null >/dev/null 2>&1 &
+      wait "$!"
+    else
+      save "$INST_DIR/$uuid.json" "$inst"
+    fi
+    delay="$(knob FAKE_GMSAAS_START_DELAY "$idx")"
+    if [ -n "$delay" ]; then sleep "$delay"; fi
+    if [ "$beh" = "startfail_created" ]; then fail 4 API_ERROR "Request timed out"; fi
+    ok "{\"instance\": $(public "$INST_DIR/$uuid.json")}"
+    ;;
+
+  "instances list")
+    if [ "${FAKE_GMSAAS_LIST_USAGE_ERROR:-}" = "1" ]; then
+      usage_fail "instances list" "No such option: --fake-broken"
+    fi
+    nlist=$(( $(cat "$FAKE_GMSAAS_DIR/list_count" 2>/dev/null || echo 0) + 1 ))
+    echo "$nlist" >"$FAKE_GMSAAS_DIR/list_count"
+    out="[]"
+    for f in "$INST_DIR"/*.json; do
+      [ -e "$f" ] || continue
+      inst="$(jq -c '
+        def seq: {normal: ["CREATING","STARTING","BOOTING","ONLINE"],
+                  adboffline: ["CREATING","STARTING","BOOTING","ONLINE"],
+                  stuckstop: ["CREATING","STARTING","BOOTING","ONLINE"],
+                  slow: ["CREATING","STARTING","BOOTING"],
+                  fail: ["CREATING","STARTING","ERROR"],
+                  vanish: ["CREATING","STARTING","GONE"],
+                  startfail_created: ["CREATING","STARTING","BOOTING","ONLINE"]}[._behaviour];
+        if ._stopped then
+          if ._behaviour == "stuckstop" then .state = "STOPPING"
+          elif ._stop_lists >= ._stop_lists_max then .state = "GONE"
+          else .state = "STOPPING" | ._stop_lists += 1 end
+        elif ._seen < ._hide then ._seen += 1 | ._hidden_now = true
+        else
+          (seq) as $s | .state = $s[[._lists, ($s | length) - 1] | min] | ._lists += 1 | ._hidden_now = false
+        end' "$f")"
+      if [ "$(jq -r '.state' <<<"$inst")" = "GONE" ]; then
+        rm -f "$f"
+        continue
+      fi
+      save "$f" "$inst"
+      if [ "$(jq -r '._hidden_now // false' <<<"$inst")" = "true" ]; then continue; fi
+      out="$(jq -c --argjson i "$(public "$f")" '. + [$i]' <<<"$out")"
+    done
+    if [ -n "${FAKE_GMSAAS_LOCK_AFTER_LISTS:-}" ] && [ "$nlist" -eq "${FAKE_GMSAAS_LOCK_AFTER_LISTS%%:*}" ]; then
+      chmod 555 "${FAKE_GMSAAS_LOCK_AFTER_LISTS#*:}"
+    fi
+    ok "$(jq -c '{instances: sort_by(.name)}' <<<"$out")"
+    ;;
+
+  "instances get")
+    uuid="${1:-}"
+    [ -f "$INST_DIR/$uuid.json" ] || fail 4 API_ERROR "Instance $uuid not found"
+    ok "{\"instance\": $(public "$INST_DIR/$uuid.json")}"
+    ;;
+
+  "instances stop")
+    uuid=""
+    for a in "$@"; do
+      case "$a" in --no-wait) ;; -*) usage_fail "instances stop" "No such option: $a" ;; *) uuid="$a" ;; esac
+    done
+    [ -n "$uuid" ] || usage_fail "instances stop" "Missing argument 'INSTANCE_UUID'."
+    f="$INST_DIR/$uuid.json"
+    [ -f "$f" ] || fail 4 API_ERROR "Instance $uuid not found"
+    if [ "$(jq -r '._stop_fail_once' "$f")" = "true" ]; then
+      save "$f" "$(jq -c '._stop_fail_once = false' "$f")"
+      fail 4 API_ERROR "Service temporarily unavailable"
+    fi
+    save "$f" "$(jq -c '._stopped = true | .state = "STOPPING" | .adbtunnel_state = "DISCONNECTED"
+      | .adb_serial = "0.0.0.0" | .adb_serial_port = 0' "$f")"
+    ok "{\"instance\": $(public "$f")}"
+    ;;
+
+  "instances adbconnect")
+    port="" uuid=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --adb-serial-port)
+          [ $# -ge 2 ] || usage_fail "instances adbconnect" "Option '--adb-serial-port' requires an argument."
+          port="$2"; shift 2 ;;
+        -*) usage_fail "instances adbconnect" "No such option: $1" ;;
+        *) uuid="$1"; shift ;;
+      esac
+    done
+    if [ -n "$port" ]; then
+      [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] ||
+        usage_fail "instances adbconnect" "Invalid value for '--adb-serial-port': $port is not in the range 1024<=x<=65535."
+    else
+      port=40000
+    fi
+    if [ -n "${FAKE_GMSAAS_ADBCONNECT_DELAY:-}" ]; then sleep "$FAKE_GMSAAS_ADBCONNECT_DELAY"; fi
+    [ -n "$uuid" ] || usage_fail "instances adbconnect" "The fake needs an INSTANCE_UUID."
+    f="$INST_DIR/$uuid.json"
+    [ -f "$f" ] || fail 4 API_ERROR "Instance $uuid not found"
+    [ "$(jq -r '.state' "$f")" = "ONLINE" ] || fail 14 ADBTUNNEL_INSTANCE_NOT_READY "Instance is not ready"
+    if [ "$(jq -r '._adb_timeout' "$f")" = "true" ]; then fail 12 ADBTUNNEL_TIMEOUT_ERROR "Timed out connecting the ADB tunnel"; fi
+    already="$(jq -r '._adb_already' "$f")"
+    if [ -n "$already" ] && [ "$already" != "$port" ]; then
+      save "$f" "$(jq -c --argjson p "$already" '.adbtunnel_state = "CONNECTED"
+        | .adb_serial = "localhost:\($p)" | .adb_serial_port = $p' "$f")"
+      fail 13 ADBTUNNEL_DIFFERENT_PORT_ERROR "Instance already connected to ADB on port $already"
+    fi
+    for p in ${FAKE_GMSAAS_BUSY_PORTS:-}; do
+      if [ "$p" = "$port" ]; then fail 11 ADBTUNNEL_BUSY_PORT_ERROR "Port $port is busy"; fi
+    done
+    for g in "$INST_DIR"/*.json; do
+      [ "$g" = "$f" ] && continue
+      if [ "$(jq -r '.adb_serial_port' "$g")" = "$port" ]; then fail 11 ADBTUNNEL_BUSY_PORT_ERROR "Port $port is busy"; fi
+    done
+    save "$f" "$(jq -c --argjson p "$port" '.adbtunnel_state = "CONNECTED"
+      | .adb_serial = "localhost:\($p)" | .adb_serial_port = $p' "$f")"
+    ok "{\"instance\": $(public "$f")}"
+    ;;
+
+  "adb start")
+    touch "$FAKE_GMSAAS_DIR/adb_started"
+    ok '{}'
+    ;;
+
+  "config get")
+    [ "${1:-}" = "android-sdk-path" ] || usage_fail "config get" "Invalid value for '{android-sdk-path|output-format|proxy}': '${1:-}'"
+    ok "$(jq -cn --arg p "${FAKE_GMSAAS_SDK_PATH:-}" '{configuration: {"android-sdk-path": $p}}')"
+    ;;
+
+  *)
+    usage_fail "$cmd" "No such command: $cmd"
+    ;;
+esac
