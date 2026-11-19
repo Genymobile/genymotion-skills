@@ -179,7 +179,7 @@ gmsaas adb stop    # Stop the ADB daemon
 
 ## Common Workflows
 
-Before any `instances start`, `gmsaas doctor` must exit 0, and the start command needs a timeout of at least 6 minutes. Use a name that no listed instance has (`gmsaas instances list` first, or `<prefix>-<run-id>-1`). If a start exits non-zero or times out, follow "Starting a SaaS instance" in `SKILL.md`: find the instance by its name, stop it, verify.
+Before any `instances start`, `gmsaas doctor` must exit 0, and the start command needs a timeout of at least 6 minutes. Use a name that no listed instance has (`gmsaas instances list` first): a readable part and a `<unique-suffix>` (a UTC timestamp and a few random characters), or `<prefix>-<run-id>-1`. If a start exits non-zero or times out, follow "Starting a SaaS instance" in `SKILL.md`: find the instance by its name, stop it, verify.
 
 ### Start an instance and connect ADB
 
@@ -188,7 +188,7 @@ Before any `instances start`, `gmsaas doctor` must exit 0, and the start command
 gmsaas recipes list
 
 # 2. Start the instance (always set a max duration, in minutes, to avoid unexpected charges)
-gmsaas instances start <recipe_uuid> "my-instance" --max-run-duration 60
+gmsaas instances start <recipe_uuid> "my-instance-<unique-suffix>" --max-run-duration 60
 
 # 3. Connect ADB
 gmsaas instances adbconnect <instance_uuid>
@@ -205,7 +205,7 @@ gmsaas instances list
 
 ```bash
 # 1. Start the instance (set the duration, in minutes, to match your expected test time)
-gmsaas instances start <recipe_uuid> "test-device" --max-run-duration 60
+gmsaas instances start <recipe_uuid> "test-device-<unique-suffix>" --max-run-duration 60
 
 # 2. Connect ADB
 gmsaas instances adbconnect <instance_uuid>
@@ -222,7 +222,7 @@ gmsaas instances list
 
 ```bash
 # 1. Start the instance
-gmsaas instances start <recipe_uuid> "my-instance" --max-run-duration 60
+gmsaas instances start <recipe_uuid> "my-instance-<unique-suffix>" --max-run-duration 60
 
 # 2. Get the instance UUID
 gmsaas instances list

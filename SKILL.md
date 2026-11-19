@@ -169,7 +169,7 @@ When the task names a device kind that is not in `recipes`, do not guess (see `r
 
 - **Always pass `--max-run-duration`**, in minutes, set to `GENYMOTION_MAX_RUN_DURATION` / `maxRunDuration` (default `60`). Never pass `0`: for `gmsaas` it means "no limit".
 - `gmsaas instances start` waits until the instance is up, for up to 5 minutes. Give the command a timeout of at least 6 minutes.
-- Give the instance a name that no listed instance has: check `gmsaas instances list` first, or use `<prefix>-<run-id>-1` (see `references/parallel-reference.md`).
+- Give the instance a name that no listed instance has: a readable part and a unique suffix, such as `pixel-8-<unique-suffix>` (a UTC timestamp and a few random characters), or `<prefix>-<run-id>-1` (see `references/parallel-reference.md`). Check `gmsaas instances list` first.
 - **If it exits non-zero, or the tool call times out, an instance may exist anyway.** Run `gmsaas instances list`, find the instance by the exact name you gave, stop it and verify the stop (see "Verify Start / Stop Operations"), then report the failure.
   - If more than one instance has that name, stop only the one created after your start (`created_at` in `gmsaas --format compactjson instances list`). In interactive mode, ask the user when in doubt.
   - Never stop an instance that you cannot tie to your own start.
@@ -182,7 +182,7 @@ When the task names a device kind that is not in `recipes`, do not guess (see `r
 Read `references/parallel-reference.md` before starting more than one device.
 
 - **SaaS, with shell access**: use `fanout.sh`, in the `scripts/` directory next to this `SKILL.md`. Run it from the project root and call it by its path; never `cd` into the skill directory.
-- `start` can run for several minutes: give it a timeout of at least 10 minutes, or run it in the background. It writes its run id on standard error before it starts any instance: if `start` ends without printing its JSON, run `fanout.sh stop --run <run-id>` at once with that id. Use `stop` without a flag only when no other run is active in this directory.
+- `start` can run for a long time: give it a timeout of at least 10 minutes plus 2 minutes per instance (20 minutes for 5), or run it in the background. Give `stop` at least 5 minutes, and 10 minutes when a `start` of the same run may still be running. `start` writes its run id on standard error before it starts any instance: if `start` ends without printing its JSON, run `fanout.sh stop --run <run-id>` at once with that id. Use `stop` without a flag only when no other run is active in this directory.
 - Keep the `run_id` from the JSON that `start` prints, and read the `status` of each instance: only `ONLINE` instances are usable.
 - **Always finish with `fanout.sh stop --run <run_id>`**, also when the tests fail.
 - **SaaS, without shell scripts**: follow the raw `gmsaas` steps of the reference.
@@ -192,7 +192,8 @@ Read `references/parallel-reference.md` before starting more than one device.
 FANOUT=.claude/skills/genymotion/scripts/fanout.sh   # example: adapt to where the skill is installed
 RESULT="$("$FANOUT" start --count 3 --recipe phone)"
 RUN_ID="$(jq -r '.run_id' <<<"$RESULT")"
-# run the tests on each serial whose status is ONLINE
+ADB="$(jq -r '.adb' <<<"$RESULT")"   # use this adb: another version restarts the ADB server and drops every run's connections
+# run the tests with "$ADB" -s <serial> on each serial whose status is ONLINE
 "$FANOUT" stop --run "$RUN_ID"
 ```
 
@@ -274,7 +275,7 @@ gmtool admin list --off
 
 ## After the device is connected: using Android tooling
 
-- A connected Genymotion device (SaaS through `gmsaas instances adbconnect`, or Desktop) is a standard ADB device. Use it with the Android CLI and Android Studio tools as you would Google's emulator: build and install, Logcat, UI inspection, LeakCanary heap dumps, and crash investigation with `android signals`. Target it by its ADB serial (`adb devices`).
+- A connected Genymotion device (SaaS through `gmsaas instances adbconnect`, or Desktop) is a standard ADB device. Use it with the Android CLI and Android Studio tools as you would Google's emulator: build and install, Logcat, UI inspection, LeakCanary heap dumps, and crash investigation with `android signals`. Target it by its ADB serial (`adb devices`). The Android tooling must use the same `adb` as `gmsaas`, the one of the Android SDK configured in `gmsaas`: another `adb` version restarts the ADB server and drops the connections.
 - Genymotion Desktop devices appear in Android Studio's device list like the Google emulator. Agents connected through Android Studio's Bring Your Own Agent can use them directly.
 - When Genymotion is the configured platform, create and stop devices with this skill, not with the Android CLI's emulator management or the AVD manager. Use `android device remote` only if the user asks for Google's physical lab devices.
 - Always stop Genymotion SaaS instances at the end of the task, including after a handoff to other tools.
@@ -416,7 +417,7 @@ User says: *"Start a Pixel 8 on Genymotion Cloud and install my app.apk"*
 Actions:
 1. Detect platform = Cloud → check gmsaas
 2. Use the configured recipe if it is a Pixel 8; otherwise `gmsaas recipes list` → ask user to pick a Pixel 8 recipe
-3. `gmsaas instances start <recipe_uuid> "pixel-8" --max-run-duration 60`
+3. `gmsaas instances start <recipe_uuid> "pixel-8-<unique-suffix>" --max-run-duration 60`
 4. `gmsaas instances get <instance_uuid>` → verify state = ONLINE before proceeding
 5. `gmsaas instances adbconnect <instance_uuid>` → note the ADB serial it prints
 6. `adb -s <serial> install app.apk`

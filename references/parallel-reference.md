@@ -22,9 +22,9 @@ decide N ──▶ start N (--no-wait, --max-run-duration) ──▶ poll all un
 ### Requirements
 
 - Bash 4.4 or later, `gmsaas` (authenticated, Android SDK path set) and `jq` in `PATH`.
-- `adb`: the script uses the one of the Android SDK configured in `gmsaas` (`<android-sdk-path>/platform-tools/adb`), and the one in `PATH` when that file does not exist. Use the same `adb` for your own commands: an `adb` of another version restarts the ADB server and drops the connections.
-- Run it **from the project directory**, and call it by its path: it is in the `scripts/` directory next to the skill's `SKILL.md` (for example `.claude/skills/genymotion/scripts/fanout.sh`). Do not `cd` into the skill directory: the script reads `.genymotion.json` and writes its state under the directory it is called from.
-- `start` can run for several minutes (up to 10 polls 30 seconds apart, then ADB). Give the command a timeout of at least 10 minutes, or run it in the background. `stop` can take up to 2 minutes, and up to 4 more when it first has to wait for a `start` of the same run that is still running.
+- `adb`: the script uses the one of the Android SDK configured in `gmsaas` (`<android-sdk-path>/platform-tools/adb`), and the one in `PATH` when that file does not exist. The result of `start` gives its path in `adb`. Use that same `adb` for your own commands: an `adb` of another version restarts the ADB server and drops the connections of every run on the machine.
+- Run every command **from the project directory**, and call the script by its path: it is in the `scripts/` directory next to the skill's `SKILL.md` (for example `.claude/skills/genymotion/scripts/fanout.sh`). Do not `cd` into the skill directory: the script reads `.genymotion.json` and keeps its run records under the directory it is called from.
+- `start` can run for a long time: up to 10 polls 30 seconds apart, then up to a minute of ADB connection for each instance, then the stop of the instances that failed. Give the command a timeout of at least 10 minutes plus 2 minutes per instance (20 minutes for 5 instances), or run it in the background. Give `stop` a timeout of at least 5 minutes, and 10 minutes when a `start` of the same run may still be running: `stop` first waits for it, up to 4 minutes.
 
 ### Commands
 
@@ -40,10 +40,10 @@ fanout.sh --help
 |---|---|
 | `start` | Starts `N` SaaS instances (default 1), waits until each is `ONLINE`, connects ADB on distinct ports, checks every serial with `adb devices`, prints the result. |
 | `status` | Prints the live state and the serial of each instance of a run. Without `--run`: the most recent run. |
-| `stop` | Stops every instance of a run, then verifies that none is still running. Without a flag: the most recent run recorded in this directory. |
-| `stop --all-mine` | Stops every recorded run, and every running instance named `<prefix>-<run-id>-<index>` for the configured prefix, then verifies. |
+| `stop` | Stops every instance of a run, then verifies that none is still running. Without a flag: the most recent run recorded in this directory. With `--run <run-id>` and no record of that run in this directory, it finds the instances of the run by their names in the account; it cannot reach a `start` of that run that is still running in its own directory, and says so. |
+| `stop --all-mine` | Stops every run recorded here with the configured prefix, and every running instance named `<prefix>-<run-id>-<index>` for that prefix, then verifies. Runs of another prefix are left alone. |
 
-Always pass `--run <run_id>` to `stop`, with the `run_id` printed by `start`. Running `stop` again on a stopped run is safe and exits 0.
+Always pass `--run <run_id>` to `stop`, with the `run_id` printed by `start`. Running `stop` again on a stopped run is safe and exits 0, from the directory that holds the record of the run.
 
 ### Settings
 
@@ -75,6 +75,7 @@ Standard output carries exactly one JSON object. Progress and errors go to stand
 ```json
 {
   "run_id": "20261118171600-a3f19c02",
+  "adb": "/home/me/Android/Sdk/platform-tools/adb",
   "instances": [
     {"name": "agent-20261118171600-a3f19c02-1", "uuid": "<instance_uuid>", "serial": "localhost:15555", "status": "ONLINE"},
     {"name": "agent-20261118171600-a3f19c02-2", "uuid": "<instance_uuid>", "serial": "localhost:15556", "status": "ONLINE"},
@@ -84,6 +85,7 @@ Standard output carries exactly one JSON object. Progress and errors go to stand
 ```
 
 - `run_id` is `null` when no run applies (configuration error, nothing recorded, `--all-mine`).
+- `adb` is in the output of `start` only: the path of the `adb` the script used, or `null` when it did not get that far.
 - `uuid` and `serial` are `null` when the instance has none.
 - An `error` string is added when the exit code is not 0.
 
@@ -91,13 +93,14 @@ Standard output carries exactly one JSON object. Progress and errors go to stand
 |---|---|
 | `ONLINE` | Running, ADB connected, serial confirmed by `adb devices`. Usable. |
 | `START_FAILED` | `gmsaas instances start` failed for this instance (for example, account quota reached). |
-| `BOOT_FAILED` | The instance left the starting states without reaching `ONLINE`, or disappeared. |
-| `TIMEOUT` | Still starting after the last poll. |
+| `BOOT_FAILED` | The instance left the starting states without reaching `ONLINE`, or was listed and then disappeared. |
+| `TIMEOUT` | Still starting, or still not listed, after the last poll. |
 | `ADB_FAILED` | `ONLINE`, but ADB could not be connected or the serial did not show as `device`. |
-| `STOPPED` | Stopped and verified. An instance that failed keeps its failure status after it is stopped. |
-| a `gmsaas` state | In `status` and `stop` output only: the live state of an instance that is neither `ONLINE` nor stopped (`BOOTING`, `STOPPING`…). |
+| `STOPPED` | Stopped and verified: `gmsaas instances list` no longer shows the instance, and `gmsaas instances get` reports it deleted or not found. Neither the answer to a stop call nor one list alone proves it. An instance that the run record already marks as verified is not checked again. An instance that failed keeps its failure status after it is stopped. |
+| `UNVERIFIED` | In `status` and `stop` output only: no list succeeded, or `gmsaas` does not list the instance and could not say whether it still exists. |
+| a `gmsaas` state | In `status` and `stop` output only: the live state of an instance that is neither `ONLINE` nor stopped (`BOOTING`, `STOPPING`…). An instance that `gmsaas` still lists as `STOPPED` is shown as `STOPPING`: here `STOPPED` always means verified. |
 
-After `start` returns, every instance that is not `ONLINE` has already been stopped, among those that `gmsaas instances list` showed. A start call that failed can still have created an instance that is listed later: `start` says so on standard error, and the final `stop --run` stops it.
+After `start` returns, every instance that is not `ONLINE` has already been stopped: `start` sends a stop for every instance it created, listed or not. One case is left: a start call that failed can still have created an instance, with a UUID the script never received, that is listed later. `start` says so on standard error, and the final `stop --run` stops it.
 
 ### Exit codes
 
@@ -105,10 +108,10 @@ After `start` returns, every instance that is not `ONLINE` has already been stop
 |---|---|---|
 | 0 | success | `start`: at least `--min` instances are usable (read each `status`: some may have failed). `stop`: verified, nothing is running. `status`: printed. |
 | 1 | partial | `start`: some instances came up, but fewer than `--min`. Everything was stopped. |
-| 2 | configuration | Bad flag, missing or invalid setting, count above the cap, `jq` / `adb` / `gmsaas` not found, a project directory that cannot be written, or (`status`) a run file that cannot be read. Nothing was started. |
-| 3 | gmsaas | `gmsaas` failed: not authenticated, API or network error, or no instance could be created. |
+| 2 | configuration | Bad flag, missing or invalid setting, count above the cap, `jq` / `adb` / `gmsaas` not found, a project directory that cannot be written, (`status`) a run file that cannot be read, or (`stop --run`, `status --run`) a run id with no record here and no instance in the account. Nothing was started. |
+| 3 | gmsaas | `gmsaas` failed: not authenticated, Android SDK path not set, API or network error, or no instance could be created. Also for `stop` and `status`, when the instances cannot be listed. |
 | 4 | timeout | `start`: no instance was usable and at least one was still starting after the last poll. Everything was stopped. |
-| 5 | failed | `start`: no instance was usable (boot or ADB failures), a `stop` was requested for this run, the result could not be printed, or the script hit an internal error. Everything was stopped. |
+| 5 | failed | `start`: no instance was usable (boot or ADB failures), the stop of a failed instance could not be verified at first, a `stop` was requested for this run, the result could not be printed, or the script hit an internal error. Everything was stopped, healthy instances included. |
 | 6 | stop incomplete | At least one instance is still running after `stop`. Run `stop` again, then check https://cloud.geny.io/instances. |
 | 129, 130, 143 | interrupted | `start` received a hang-up, Ctrl-C or a termination signal. It stopped everything it had started before exiting. |
 
@@ -119,7 +122,8 @@ After `start` returns, every instance that is not `ONLINE` has already been stop
 - The run is recorded in `.genymotion/runs/<run-id>.json` (UUIDs, names, serials) as soon as each instance exists, so `stop` works from a new shell. Each name is recorded before its start call: `stop` and `status` also find an instance whose UUID was not recorded yet, by its exact name.
 - Failed instances are stopped and reported; healthy ones are kept, as long as there are at least `--min` of them.
 - An interrupted or crashed `start` stops everything it started. So does a `start` whose output pipe is closed, and a `start` whose run receives a `stop` from another shell: that `start` exits with code 5, and the `stop` waits for it.
-- A non-zero exit code from `start` means that every instance `gmsaas` listed was stopped, except with code 6. The final `stop --run <run_id>` is still required: it also stops an instance that was listed too late.
+- A non-zero exit code from `start` means that every instance it created was stopped, except with code 6. The final `stop --run <run_id>` is still required: it also stops an instance whose start call failed and that was listed too late.
+- An instance that `gmsaas` does not list yet is not a failed one: `start` waits for it until the last poll.
 - A busy ADB port is skipped: the script tries the next port.
 - The API token is never printed or logged.
 
@@ -137,8 +141,9 @@ RESULT="$("$FANOUT" start --count 3 --recipe phone)"
 RUN_ID="$(jq -r '.run_id' <<<"$RESULT")"
 
 # 2. Run the tests on every usable device
+ADB="$(jq -r '.adb' <<<"$RESULT")"      # the adb the script used
 for SERIAL in $(jq -r '.instances[] | select(.status == "ONLINE") | .serial' <<<"$RESULT"); do
-  adb -s "$SERIAL" install -r app.apk
+  "$ADB" -s "$SERIAL" install -r app.apk
 done
 
 # 3. Always stop the run, also when a step above failed
@@ -147,7 +152,7 @@ done
 
 `--all-mine` matches the names `<prefix>-<run-id>-<index>` across the whole account, whoever started them. On a shared account, give each user or pipeline its own `GENYMOTION_INSTANCE_PREFIX`.
 
-The script writes its own `.gitignore` inside `.genymotion/runs/`, so the state files stay out of git. Adding `.genymotion/runs/` to the project's `.gitignore` makes that visible.
+The script writes its own `.gitignore` inside `.genymotion/runs/`, so the run records stay out of git. Adding `.genymotion/runs/` to the project's `.gitignore` makes that visible. `start` deletes the records that are more than 30 days old, when `gmsaas` lists no instance of their run. An instance cannot run for more than 28800 minutes (20 days).
 
 ---
 
@@ -196,9 +201,10 @@ Repeat up to 10 times, 30 seconds apart (the limits of `SKILL.md`), and read the
 |---|---|
 | `ONLINE` | Ready. |
 | `CREATING`, `STARTING`, `OFFLINE`, `BOOTING`, `UNKNOWN` | Still starting. Wait. |
-| anything else, or the instance is no longer listed | Failed. |
+| not listed yet | Still starting. Wait. |
+| anything else, or the instance was listed and is no longer listed | Failed. |
 
-An instance that is still starting after the 10th poll has timed out. With `--no-wait`, an instance goes through several starting states before `BOOTING`; none of them is an error.
+An instance that is still starting, or still not listed, after the 10th poll has timed out. With `--no-wait`, an instance goes through several starting states before `BOOTING`; none of them is an error.
 
 ### 4. Connect ADB on distinct ports
 
@@ -244,7 +250,7 @@ export ANDROID_SERIAL=localhost:15556         # every adb command of this shell
 
 ### 7. Teardown (mandatory)
 
-Stop every instance of the run, by recorded UUID. If a UUID was lost, find the instance in `gmsaas instances list` by the full run prefix `<prefix>-<run-id>-`. Never match on the bare prefix: it also matches the instances of other runs.
+Stop every instance of the run, by recorded UUID, whether `gmsaas instances list` shows it or not. If a UUID was lost, find the instance in `gmsaas instances list` by the full run prefix `<prefix>-<run-id>-`. Never match on the bare prefix: it also matches the instances of other runs.
 
 ```bash
 gmsaas instances stop <instance_uuid_1>

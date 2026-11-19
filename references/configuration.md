@@ -51,7 +51,8 @@ env | grep -E '^(CI|GENYMOTION_(PLATFORM|SAAS_RECIPE|DESKTOP_DEVICE|MAX_RUN_DURA
 
 ```powershell
 # Windows (PowerShell)
-Get-ChildItem Env: | Where-Object { ($_.Name -eq 'CI' -or $_.Name -like 'GENYMOTION_*') -and $_.Name -ne 'GENYMOTION_API_TOKEN' }
+'CI', 'GENYMOTION_PLATFORM', 'GENYMOTION_SAAS_RECIPE', 'GENYMOTION_DESKTOP_DEVICE', 'GENYMOTION_MAX_RUN_DURATION', 'GENYMOTION_MAX_INSTANCES', 'GENYMOTION_INSTANCE_PREFIX', 'GENYMOTION_ADB_BASE_PORT', 'GENYMOTION_NONINTERACTIVE' |
+  ForEach-Object { $v = [Environment]::GetEnvironmentVariable($_); if ($v) { "$_=$v" } }
 ```
 
 Then read `.genymotion.json` at the repository root, if it exists. `scripts/fanout.sh` does both by itself.

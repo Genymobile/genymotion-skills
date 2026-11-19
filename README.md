@@ -224,14 +224,15 @@ Every setting, its environment variable and its default are in [`references/conf
 FANOUT=.claude/skills/genymotion/scripts/fanout.sh   # example: adapt to where the skill is installed
 RESULT="$("$FANOUT" start --count 3 --recipe <recipe_uuid>)"
 RUN_ID="$(jq -r '.run_id' <<<"$RESULT")"
+ADB="$(jq -r '.adb' <<<"$RESULT")"   # use this adb: another version restarts the ADB server and drops every run's connections
 
-# run the tests on each device whose status is ONLINE
+# run the tests with "$ADB" -s <serial> on each device whose status is ONLINE
 jq -r '.instances[] | select(.status == "ONLINE") | .serial' <<<"$RESULT"
 
 "$FANOUT" stop --run "$RUN_ID"      # always, also when the tests fail
 ```
 
-- `start` can run for several minutes: give it a timeout of at least 10 minutes, or run it in the background. It writes its run id on standard error before it starts any instance: if it ends without printing its JSON, run `fanout.sh stop --run <run-id>` at once with that id. Use `stop` without a flag only when no other run is active in this directory: it stops the most recent run, which may belong to another agent.
+- `start` can run for a long time: give it a timeout of at least 10 minutes plus 2 minutes per instance (20 minutes for 5), or run it in the background. Give `stop` at least 5 minutes, and 10 minutes when a `start` of the same run may still be running. `start` writes its run id on standard error before it starts any instance: if it ends without printing its JSON, run `fanout.sh stop --run <run-id>` at once with that id. Use `stop` without a flag only when no other run is active in this directory: it stops the most recent run, which may belong to another agent.
 - The script records each run under `.genymotion/runs/` and keeps that directory out of git with its own `.gitignore`. Adding `.genymotion/runs/` to your project's `.gitignore` makes that visible.
 
 Details, exit codes and the steps without the script: [`references/parallel-reference.md`](references/parallel-reference.md).

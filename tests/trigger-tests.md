@@ -80,11 +80,11 @@ Expected behavior:
 1. Platform detected: Cloud
 2. `gmsaas` availability checked
 3. `gmsaas recipes list` executed — user asked to pick one (interactive mode, no recipe configured)
-4. `gmsaas instances start <recipe_uuid> <name> --max-run-duration <minutes>` executed (default 60)
+4. `gmsaas instances start <recipe_uuid> "pixel-8-pro-<unique-suffix>" --max-run-duration <minutes>` executed (default 60), with a name that no listed instance has
 5. State polled until ONLINE (up to 10 × 30s); `CREATING`, `STARTING`, `OFFLINE`, `BOOTING` and `UNKNOWN` mean "still starting"
 6. `gmsaas instances adbconnect <instance_uuid>` executed
 7. `adb devices` verified — instance appears
-8. `adb install app.apk` executed
+8. `adb -s <serial> install app.apk` executed, with the serial printed by `adbconnect`
 9. User reminded to stop the instance when done
 
 ### Test 2 — Desktop: start device
@@ -219,7 +219,7 @@ Expected behavior:
 4. `ci-team-<other-run-id>-1` left running
 
 ### Test 15 — Single start times out, an older instance has the same name
-**Context**: the name check was skipped or raced, so an older instance named `pixel-8` is running; `gmsaas instances start <recipe_uuid> "pixel-8" --max-run-duration 60` times out
+**Context**: the name check and the unique suffix were skipped, so an older instance named `pixel-8` is running; `gmsaas instances start <recipe_uuid> "pixel-8" --max-run-duration 60` times out
 
 Expected behavior:
 1. `gmsaas instances list` shows two `pixel-8` instances
@@ -230,7 +230,7 @@ Expected behavior:
 **Context**: `gmsaas instances list` shows an instance named `pixel-8` before the start
 
 Expected behavior:
-1. A different name is chosen (for example `<prefix>-<run-id>-1`) and passed to `gmsaas instances start`
+1. A name that no listed instance has is chosen (`pixel-8-<unique-suffix>`, or `<prefix>-<run-id>-1`) and passed to `gmsaas instances start`
 2. No two instances share a name
 
 ### Test 16 — `fanout.sh start` killed while another run is recorded
@@ -240,3 +240,11 @@ Expected behavior:
 1. The run id read from the standard error of `start`
 2. `fanout.sh stop --run <that run id>` run and verified
 3. No flagless `stop`; the other agent's run keeps running
+
+### Test 17 — Working directory changed before the teardown
+**Context**: `fanout.sh start` ran in the project root and printed `run_id`; before the teardown, the agent's working directory is another directory, with no record of that run
+
+Expected behavior:
+1. `fanout.sh stop --run <run_id>` run from that other directory
+2. The script finds the instances of the run by their names (`<prefix>-<run-id>-<index>`) in the account and stops them
+3. Stop verified: exit code 0, no instance of the run listed by `gmsaas instances list`
