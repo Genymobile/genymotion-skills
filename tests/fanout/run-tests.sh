@@ -25,6 +25,11 @@ trap 'chmod -R u+w "$TMPROOT" 2>/dev/null; rm -rf "$TMPROOT"' EXIT
 mkdir -p "$TMPROOT/bashbin"
 ln -s "$BASH" "$TMPROOT/bashbin/bash"
 SAFE_PATH="$FAKES:$TMPROOT/bashbin:/usr/bin:/bin"
+# Default Android SDK for the fake gmsaas: platform-tools/adb is a link to the
+# fake adb, so the script takes the SDK branch of its adb lookup by default.
+SDK_DEFAULT="$TMPROOT/sdk"
+mkdir -p "$SDK_DEFAULT/platform-tools"
+ln -s "$FAKES/adb" "$SDK_DEFAULT/platform-tools/adb"
 
 RECIPE_A="11111111-1111-4111-8111-111111111111"
 RECIPE_B="22222222-2222-4222-8222-222222222222"
@@ -63,7 +68,7 @@ new_project() {
 
 base_env() {
   printf '%s\n' "PATH=$SAFE_PATH" "HOME=$PROJ" "TMPDIR=$PROJ/.tmp" "FAKE_GMSAAS_DIR=$FAKE" \
-    "GENYMOTION_POLL_INTERVAL=0" "GENYMOTION_STOP_POLL_INTERVAL=0"
+    "FAKE_GMSAAS_SDK_PATH=$SDK_DEFAULT" "GENYMOTION_POLL_INTERVAL=0" "GENYMOTION_STOP_POLL_INTERVAL=0"
 }
 
 fail() { echo "    assertion failed: $*" >&2; T_FAILED=1; }
@@ -85,7 +90,7 @@ fan() {
   local -a env_list
   mapfile -t env_list < <(base_env)
   RC=0
-  (cd "$PROJ" && env -i "${env_list[@]}" ${ENVX[@]+"${ENVX[@]}"} "$SCRIPT" "$@") \
+  (cd "${FAN_DIR:-$PROJ}" && env -i "${env_list[@]}" ${ENVX[@]+"${ENVX[@]}"} "$SCRIPT" "$@") \
     >"$OUT" 2>"$ERR" </dev/null || RC=$?
   if ! [[ " $* " == *" --help "* || " $* " == *" -h "* ]]; then
     one_json || fail "stdout is not exactly one JSON object for: $* (got: $(head -c 300 "$OUT"))"
@@ -99,6 +104,7 @@ jt() { jq -e "$@" "$OUT" >/dev/null 2>&1; }       # test the last stdout
 rc_is() { [ "$RC" -eq "$1" ]; }
 fake_count() { find "$FAKE/instances" -name '*.json' | wc -l; }
 fake_none() { [ "$(fake_count)" -eq 0 ]; }
+fake_clear() { find "$FAKE/instances" -name '*.json' -type f -delete; }   # every fake instance disappears
 count_calls() { # pattern -> number of gmsaas calls matching it (0 when there is no log)
   local n
   n="$(grep -c -- "$1" "$FAKE/calls.log" 2>/dev/null)" || true
@@ -395,8 +401,8 @@ t_all_slow_timeout() {
   rc_is 4 || fail "exit 4 (got $RC)"
   fake_none || fail "fake has no instance left"
   jt '[.instances[].status] == ["TIMEOUT","TIMEOUT"]' || fail "both TIMEOUT"
-  # 1 preflight + 10 boot polls + 1 name-prefix sweep + 1 list before the stop calls.
-  [ "$(lists_before_first_stop)" -eq 13 ] || fail "exactly 10 boot polls (got $(lists_before_first_stop) lists before the first stop)"
+  # 1 preflight + 10 boot polls + 1 name sweep before the teardown stop calls.
+  [ "$(lists_before_first_stop)" -eq 12 ] || fail "exactly 10 boot polls (got $(lists_before_first_stop) lists before the first stop)"
 }
 
 t_all_failed_exit5() {
@@ -431,6 +437,8 @@ t_all_start_failed_exit3() {
   rc_is 3 || fail "exit 3 (got $RC)"
   jt '[.instances[].status] == ["START_FAILED","START_FAILED"]' || fail "both START_FAILED"
   fake_none || fail "fake has no instance"
+  ! jt '.error | test("every instance of the run was stopped")' || fail "no claim about instances the script cannot see"
+  jt '.error | test("2 failed start call\\(s\\) may still have created an instance")' || fail "error says what was not verified"
 }
 
 t_auth_failure() {
@@ -679,6 +687,9 @@ t_help() {
   rc_is 0 || fail "--help exit 0 (got $RC)"
   grep -q '^Usage:' "$OUT" || fail "--help prints usage on stdout"
   grep -q 'Exit codes:' "$OUT" || fail "--help lists exit codes"
+  grep -q 'the stop of a failed instance could not' "$OUT" || fail "--help: exit 5 causes as in the contract"
+  grep -q 'no record here and no instance in the account' "$OUT" || fail "--help: exit 2 for an unknown run id"
+  grep -q 'Android SDK path not set' "$OUT" || fail "--help: exit 3 for a missing Android SDK path"
   fan start -h
   rc_is 0 || fail "start -h exit 0 (got $RC)"
   [ ! -s "$FAKE/calls.log" ] || fail "-h makes no gmsaas call"
@@ -754,8 +765,8 @@ t_missing_binaries() {
 
   RC=0
   (cd "$PROJ" && env -i "PATH=$noadb" "HOME=$PROJ" "TMPDIR=$PROJ/.tmp" "FAKE_GMSAAS_DIR=$FAKE" "GENYMOTION_SAAS_RECIPE=$RECIPE_A" \
-    "FAKE_GMSAAS_SDK_PATH=$PROJ/.sdk-without-adb" "$SCRIPT" start) >"$OUT" 2>"$ERR" </dev/null || RC=$?
-  rc_is 2 || fail "adb missing (SDK without adb, none in PATH): exit 2 (got $RC)"
+    "FAKE_GMSAAS_SDK_PATH=$SDK_DEFAULT" "FAKE_GMSAAS_CONFIG_GET_FAIL=1" "$SCRIPT" start) >"$OUT" 2>"$ERR" </dev/null || RC=$?
+  rc_is 2 || fail "adb missing (SDK path unreadable, none in PATH): exit 2 (got $RC)"
   err_has "android-sdk-path" || fail "adb missing: hint names the gmsaas Android SDK path"
   err_has "platform-tools" || fail "adb missing: platform-tools hint"
   one_json || fail "adb missing: one JSON object"
@@ -779,7 +790,6 @@ t_defaults_match_contract() {
   done
 }
 
-# --- Tests added for review round 1 ------------------------------------------------
 
 # A closed output pipe (SIGPIPE) must not kill start without a teardown.
 t_pipe_closed_tears_down() {
@@ -812,6 +822,8 @@ t_stdout_closed_tears_down() {
   rc_is 5 || fail "stdout closed: exit 5 (got $RC)"
   fake_none || fail "stdout closed: fake has no instance left (got $(fake_count))"
   err_has "could not be printed" || fail "stdout closed: stderr says the result could not be printed"
+  ! err_has "internal error" || fail "stdout closed: no internal error"
+  [ "$(stop_calls)" -eq 2 ] || fail "stdout closed: torn down once, one stop call per instance (got $(stop_calls))"
 }
 
 t_corrupt_state_file() {
@@ -1027,12 +1039,20 @@ t_adb_resolution() {
   rc_is 0 || fail "SDK path with ~: exit 0 (got $RC)"
   [ -s "$FAKE/sdk_adb.log" ] || fail "SDK path with ~: expanded to HOME"
   rm -f "$FAKE/sdk_adb.log"
-  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  # No SDK path in gmsaas: gmsaas itself refuses to list (exit 6), as 1.16.0 does.
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_SDK_PATH=")
   fan start --count 1
-  rc_is 0 || fail "no SDK path: exit 0 (got $RC)"
-  [ ! -e "$FAKE/sdk_adb.log" ] || fail "no SDK path: the SDK adb was not used"
-  err_has "using adb from PATH: $FAKES/adb" || fail "no SDK path: adb from PATH logged"
-  [ "$(count_calls ' config get android-sdk-path')" -eq 3 ] || fail "one config get per start"
+  rc_is 3 || fail "no SDK path: exit 3 (got $RC)"
+  err_has "no Android SDK path set" || fail "no SDK path: gmsaas message relayed"
+  [ "$(start_calls)" -eq 2 ] || fail "no SDK path: no start call (got $(start_calls) in total)"
+  # config get itself fails: adb from PATH.
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_CONFIG_GET_FAIL=1")
+  fan start --count 1
+  rc_is 0 || fail "config get fails: exit 0 (got $RC)"
+  [ ! -e "$FAKE/sdk_adb.log" ] || fail "config get fails: the SDK adb was not used"
+  err_has "using adb from PATH: $FAKES/adb" || fail "config get fails: adb from PATH logged"
+  jt ".adb == \"$FAKES/adb\"" || fail "config get fails: the output gives the PATH adb"
+  [ "$(count_calls ' config get android-sdk-path')" -eq 3 ] || fail "one config get per start that got that far"
 }
 
 # An internal error after the first start call: everything is stopped, exit 5.
@@ -1079,6 +1099,537 @@ t_no_auth_and_usage_errors() {
   rc_is 3 || fail "usage error (plain text): exit 3 (got $RC)"
   err_has "Error: No such option: --fake-broken" || fail "usage error: last line relayed"
   [ "$(start_calls)" -eq 0 ] || fail "zero start calls"
+}
+
+
+# start under TZ=UTC, stop under another time zone: the pid file start time
+# still matches, so stop waits for the running start.
+t_stop_waits_across_time_zones() {
+  local run tz="Asia/Tokyo"
+  [ -e /usr/share/zoneinfo/Asia/Tokyo ] || tz="JST-9"
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_START_DELAY_2=3" "TZ=UTC")
+  bg_start start --count 3
+  wait_fake_at_least 2 || fail "instance 2 created"
+  run="$(run_id_from "$BG_ERR")"
+  ENVX=("TZ=$tz")
+  fan stop --run "$run"
+  rc_is 0 || fail "stop exit 0 (got $RC)"
+  err_has "start of run $run is still running" || fail "stop logs that it waits for the start (TZ=$tz)"
+  ! kill -0 "$BG_PID" 2>/dev/null || fail "the start was no longer alive when stop returned"
+  bg_wait
+  rc_is 5 || fail "start exit 5 (got $RC)"
+}
+
+# An instance that gmsaas never lists still gets a stop call, and is verified
+# stopped only by a list after it was listed, or by "instances get".
+t_unlisted_instance_stopped() {
+  local run u
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_HIDE_LISTS_1=100")
+  fan start --count 1
+  rc_is 4 || fail "never listed: exit 4 (got $RC)"
+  jt '.instances[0].status == "TIMEOUT"' || fail "never listed: TIMEOUT"
+  [ "$(stop_calls)" -ge 1 ] || fail "never listed: a stop call was issued"
+  fake_none || fail "never listed: fake has no instance left (got $(fake_count))"
+  jt '.error | test("every instance of the run was stopped")' || fail "never listed: verified, says so"
+  # Every stop call fails: not verified, exit 6, and the message says so.
+  reset_logs
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_HIDE_LISTS_1=100" "FAKE_GMSAAS_STOP_ERROR_CODE_1=10")
+  fan start --count 1
+  rc_is 6 || fail "stop refused (exit 10): exit 6 (got $RC)"
+  jt '.error | test("1 instance\\(s\\) not verified stopped")' || fail "stop refused: the error gives the real number left"
+  ! jt '.error | test("every instance of the run was stopped")' || fail "stop refused: no false claim"
+  [ "$(fake_count)" -eq 1 ] || fail "stop refused: the instance is still there (got $(fake_count))"
+  fake_clear
+  # Gone before the stop: the stop call gets a 404, which proves nothing;
+  # "instances get" (404) verifies it.
+  reset_logs
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  run="$(j .run_id)"
+  u="$(j '.instances[0].uuid')"
+  fake_clear
+  fan stop --run "$run"
+  rc_is 0 || fail "already gone: stop exit 0 (got $RC)"
+  [ "$(count_calls " instances get $u")" -ge 1 ] || fail "already gone: verified with instances get"
+  jf '.instances[0].stop_verified == true' "$(state_file "$run")" || fail "already gone: recorded as verified"
+}
+
+# API outage: list (502), stop (503) and get (503) all fail with exit 4.
+# Nothing is verified: exit 6, no STOPPED, nothing recorded as verified.
+t_stop_during_api_outage() {
+  local run lc
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 2
+  run="$(j .run_id)"
+  lc="$(cat "$FAKE/list_count")"
+  # The preflight list of stop works; every later list fails.
+  ENVX=("FAKE_GMSAAS_LIST_FAIL_AFTER=$((lc + 1))" "FAKE_GMSAAS_STOP_UNAVAILABLE=1" "FAKE_GMSAAS_GET_UNAVAILABLE=1")
+  fan stop --run "$run"
+  rc_is 6 || fail "exit 6 (got $RC)"
+  ! jt '[.instances[].status] | index("STOPPED")' || fail "no instance reported STOPPED"
+  jf '[.instances[].stop_verified] == [false, false]' "$(state_file "$run")" || fail "nothing recorded as verified"
+  [ "$(fake_count)" -eq 2 ] || fail "both instances still exist (got $(fake_count))"
+  jt '.error | test("2 instance\\(s\\) not verified stopped")' || fail "error gives the number not verified"
+}
+
+# A never-listed instance whose first stop call fails (503): the stop is sent
+# again, and the instance is verified only once a list or get proves it gone.
+t_unlisted_stop_transient_4() {
+  local run
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_HIDE_LISTS_1=30" "FAKE_GMSAAS_STOP_FAIL_ONCE_1=1")
+  fan start --count 1
+  run="$(j .run_id)"
+  rc_is 4 || fail "exit 4 (got $RC)"
+  [ "$(stop_calls)" -ge 2 ] || fail "the failed stop call was sent again (got $(stop_calls))"
+  fake_none || fail "no instance left (got $(fake_count))"
+  jf '.instances[0].stop_verified == true' "$(state_file "$run")" || fail "recorded as verified"
+  reset_logs
+  ENVX=()
+  fan stop --run "$run"
+  rc_is 0 || fail "next stop: exit 0 (got $RC)"
+  [ "$(stop_calls)" -eq 0 ] || fail "next stop: no stop call for a verified run"
+}
+
+# A never-listed instance whose stop is accepted and that stays unlisted while
+# it stops: the lists prove nothing; it is verified once get says 404.
+t_hidden_stop_verified_by_get() {
+  local run u
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_HIDE_LISTS_1=100" "FAKE_GMSAAS_HIDE_STOPPED_1=1"
+        "FAKE_GMSAAS_STOP_LISTS_1=3")
+  fan start --count 1
+  run="$(j .run_id)"
+  u="$(j '.instances[0].uuid')"
+  rc_is 4 || fail "exit 4 (got $RC)"
+  fake_none || fail "no instance left when start returns (got $(fake_count))"
+  [ "$(count_calls " instances get $u")" -ge 2 ] || fail "get asked until it said 404 (got $(count_calls " instances get $u"))"
+  jf '.instances[0].stop_verified == true' "$(state_file "$run")" || fail "recorded as verified"
+}
+
+# "ps" that cannot print lstart: the pid file has no start time. stop still
+# waits for the running start, and never deletes the stop marker.
+t_stop_marker_kept_without_ps_lstart() {
+  local run psdir="$PROJ/.ps-broken" p
+  mkdir -p "$psdir"
+  printf '#!/bin/sh\nexit 1\n' >"$psdir/ps"
+  chmod +x "$psdir/ps"
+  p="$FAKES:$psdir:$TMPROOT/bashbin:/usr/bin:/bin"
+  [ "$(PATH="$p" command -v gmsaas)" = "$FAKES/gmsaas" ] || { fail "gmsaas resolves to the fake"; return 0; }
+  ENVX=("PATH=$p" "GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_START_DELAY_2=3")
+  bg_start start --count 3
+  wait_fake_at_least 2 || fail "instance 2 created"
+  run="$(run_id_from "$BG_ERR")"
+  ENVX=("PATH=$p")
+  fan stop --run "$run"
+  rc_is 0 || fail "stop exit 0 (got $RC)"
+  ! kill -0 "$BG_PID" 2>/dev/null || fail "stop waited for the start (start time unknown)"
+  bg_wait
+  rc_is 5 || fail "start exit 5 (got $RC)"
+  fake_none || fail "no instance left (got $(fake_count))"
+  [ -e "$PROJ/.genymotion/runs/$run.stop" ] || fail "the stop marker was kept"
+}
+
+# status: an instance not listed yet is not STOPPED: get gives its state, or
+# UNVERIFIED when get fails.
+t_status_unlisted_not_stopped() {
+  local run
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "GENYMOTION_POLL_INTERVAL=30" "FAKE_GMSAAS_HIDE_LISTS_1=100")
+  bg_start start --count 1
+  wait_sleeping_child "$BG_PID" || fail "start waiting between two polls"
+  run="$(run_id_from "$BG_ERR")"
+  ENVX=()
+  fan status --run "$run"
+  rc_is 0 || fail "status exit 0 (got $RC)"
+  jt '.instances[0].status == "CREATING"' || fail "status gives the get state (got: $(j '.instances[0].status'))"
+  ENVX=("FAKE_GMSAAS_GET_UNAVAILABLE=1")
+  fan status --run "$run"
+  jt '.instances[0].status == "UNVERIFIED"' || fail "status UNVERIFIED when get fails (got: $(j '.instances[0].status'))"
+  [ "$(stop_calls)" -eq 0 ] || fail "status makes no stop call"
+  kill -TERM "$BG_PID" 2>/dev/null
+  bg_wait
+  fake_none || fail "no instance left after the start was interrupted (got $(fake_count))"
+}
+
+# not listed yet is still starting.
+t_not_listed_yet_is_starting() {
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_HIDE_LISTS_1=1")
+  fan start --count 1
+  rc_is 0 || fail "exit 0 (got $RC)"
+  jt '.instances[0].status == "ONLINE"' || fail "ONLINE one poll later"
+}
+
+# a stop request during the ADB phase is seen before the next adbconnect.
+t_stop_marker_during_adb_phase() {
+  local run
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_ADBCONNECT_DELAY=2")
+  bg_start start --count 3
+  wait_calls_at_least ' adbconnect ' 1 || fail "first adbconnect in flight"
+  run="$(run_id_from "$BG_ERR")"
+  : >"$PROJ/.genymotion/runs/$run.stop"
+  bg_wait
+  rc_is 5 || fail "start exit 5 (got $RC)"
+  [ "$(count_calls ' adbconnect ')" -eq 1 ] || fail "no adbconnect after the stop request (got $(count_calls ' adbconnect '))"
+  fake_none || fail "fake has no instance left (got $(fake_count))"
+}
+
+# --all-mine leaves the runs of another prefix alone.
+t_all_mine_other_prefix_left_alone() {
+  local alice bob ub
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --prefix alice
+  alice="$(j .run_id)"
+  fan start --prefix bob
+  bob="$(j .run_id)"
+  ub="$(j '.instances[0].uuid')"
+  reset_logs
+  ENVX=("GENYMOTION_INSTANCE_PREFIX=alice")
+  fan stop --all-mine
+  rc_is 0 || fail "exit 0 (got $RC)"
+  ! fake_has_name "alice-$alice-1" || fail "alice run stopped"
+  fake_has_name "bob-$bob-1" || fail "bob run still running"
+  [ "$(count_calls " instances stop --no-wait $ub")" -eq 0 ] || fail "no stop call for bob"
+  [ ! -e "$PROJ/.genymotion/runs/$bob.stop" ] || fail "no stop marker for bob"
+}
+
+# stop --run and status --run from a directory with no record of the run.
+t_run_from_other_directory() {
+  local run other="$PROJ/.elsewhere"
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 2
+  run="$(j .run_id)"
+  mkdir -p "$other"
+  ENVX=()
+  FAN_DIR="$other" fan status --run "$run"
+  rc_is 0 || fail "status elsewhere: exit 0 (got $RC)"
+  jt '[.instances[].status] == ["ONLINE","ONLINE"]' || fail "status elsewhere: live states by name"
+  FAN_DIR="$other" fan stop --run "$run"
+  rc_is 0 || fail "stop elsewhere: exit 0 (got $RC)"
+  err_has "has no record in this directory" || fail "stop elsewhere: says the run has no record here"
+  err_has "cannot be reached from here" || fail "stop elsewhere: warns that a start running elsewhere is out of reach"
+  jt '[.instances[].status] == ["STOPPED","STOPPED"]' || fail "stop elsewhere: prints the stopped instances"
+  fake_none || fail "stop elsewhere: fake has no instance left (got $(fake_count))"
+  [ ! -e "$other/.genymotion" ] || fail "stop elsewhere: writes no run record"
+  FAN_DIR="$other" fan stop --run 20200101000000-0badcafe
+  rc_is 2 || fail "unknown run elsewhere: stop exit 2 (got $RC)"
+  FAN_DIR="$other" fan status --run 20200101000000-0badcafe
+  rc_is 2 || fail "unknown run elsewhere: status exit 2 (got $RC)"
+}
+
+# no raw bash error on stderr when a finished run is stopped.
+t_no_raw_bash_errors_on_stop() {
+  local run
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  run="$(j .run_id)"
+  fan stop --run "$run"
+  rc_is 0 || fail "exit 0 (got $RC)"
+  ! grep -q 'No such file or directory' "$ERR" || fail "no raw 'No such file or directory' on stderr"
+  ! grep -Eq 'line [0-9]+:' "$ERR" || fail "no raw bash error on stderr"
+}
+
+# a hung "adb devices" neither blocks the signal teardown nor the run.
+t_adb_devices_hang_signal() {
+  local t0
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_ADB_HANG=60")
+  bg_start start --count 1
+  local i
+  for ((i = 0; i < 100; i++)); do grep -q '^devices' "$FAKE/adb_calls.log" 2>/dev/null && break; sleep 0.1; done
+  grep -q '^devices' "$FAKE/adb_calls.log" 2>/dev/null || fail "adb devices in flight"
+  t0=$SECONDS
+  kill -TERM "$BG_PID"
+  bg_wait
+  rc_is 143 || fail "exit 143 (got $RC)"
+  [ $((SECONDS - t0)) -le 6 ] || fail "exited within a few seconds ($((SECONDS - t0)) s)"
+  fake_none || fail "fake has no instance left (got $(fake_count))"
+}
+
+# Timing: about 20 s (the adb devices timeout).
+t_adb_devices_hang_bounded() {
+  local t0=$SECONDS
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_ADB_HANG_ONCE=60")
+  fan start --count 1
+  rc_is 0 || fail "exit 0 (got $RC)"
+  jt '.instances[0].status == "ONLINE"' || fail "ONLINE after the hung check was killed"
+  [ $((SECONDS - t0)) -le 40 ] || fail "bounded: done within 40 s ($((SECONDS - t0)) s)"
+}
+
+# "adb" in the output of start only.
+t_adb_key_in_start_output() {
+  local run
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  jt ".adb == \"$SDK_DEFAULT/platform-tools/adb\"" || fail "start: adb is the SDK adb"
+  run="$(j .run_id)"
+  fan status --run "$run"
+  jt 'has("adb") | not' || fail "status: no adb key"
+  fan stop --run "$run"
+  jt 'has("adb") | not' || fail "stop: no adb key"
+  fan start --count 99
+  rc_is 2 || fail "start error: exit 2 (got $RC)"
+  jt 'has("adb") and .adb == null' || fail "start error: adb is null"
+}
+
+# gmsaas STOPPED is shown as STOPPING; a stop is re-issued for OFFLINE.
+t_stopped_shown_as_stopping() {
+  local run u
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_BEHAVIOUR_1=stuckstop" "FAKE_GMSAAS_STOP_STATE_1=STOPPED")
+  fan start --count 1
+  run="$(j .run_id)"
+  fan stop --run "$run"
+  rc_is 6 || fail "stop exit 6 (got $RC)"
+  jt '.instances[0].status == "STOPPING"' || fail "stop: gmsaas STOPPED shown as STOPPING"
+  fan status --run "$run"
+  jt '.instances[0].status == "STOPPING"' || fail "status: gmsaas STOPPED shown as STOPPING"
+  rm -f "$FAKE"/instances/*.json
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_STOP_STATE_1=OFFLINE" "FAKE_GMSAAS_STOP_LISTS_1=3")
+  fan start --count 1
+  run="$(j .run_id)"
+  u="$(j '.instances[0].uuid')"
+  fan stop --run "$run"
+  rc_is 0 || fail "OFFLINE: stop exit 0 (got $RC)"
+  [ "$(count_calls " instances stop --no-wait $u")" -ge 2 ] || fail "OFFLINE: the stop was issued again"
+}
+
+# --all-mine and a start still running whose record has no UUID yet (its first
+# start call failed, its second is in flight): the listed instance carries a
+# recorded name, so the run gets a marker and the start tears itself down.
+t_all_mine_reaches_running_start() {
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_BEHAVIOUR_1=startfail" "FAKE_GMSAAS_START_DELAY_2=3")
+  bg_start start --count 3
+  wait_fake_at_least 1 || fail "instance 2 created"
+  ENVX=()
+  fan stop --all-mine
+  rc_is 0 || fail "stop --all-mine exit 0 (got $RC)"
+  ! kill -0 "$BG_PID" 2>/dev/null || fail "stop --all-mine waited for the start"
+  bg_wait
+  rc_is 5 || fail "start exit 5 (got $RC)"
+  fake_none || fail "no instance left (got $(fake_count))"
+}
+
+# Run files: stop keeps the marker, start removes its pid file; start deletes
+# the files of runs older than 30 days with no listed instance; --all-mine
+# skips a run already verified stopped whose recorded names are not listed.
+t_run_records_cleanup() {
+  local run d old_gone="20200101000000-00000001" old_live="20200101000000-00000002" old_bad="20200101000000-00000003"
+  d="$PROJ/.genymotion/runs"
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  run="$(j .run_id)"
+  [ ! -e "$d/$run.pid" ] || fail "start removed its own pid file"
+  fan stop --run "$run"
+  rc_is 0 || fail "stop exit 0 (got $RC)"
+  [ -e "$d/$run.stop" ] || fail "stop keeps the stop marker"
+  # --all-mine: a run already verified stopped gets no marker and no stop call,
+  # and an instance of another prefix carrying its run id is left alone.
+  mv "$d/$run.stop" "$PROJ/.marker-saved"
+  reset_logs
+  fake_start "other-$run-1"
+  ENVX=()
+  fan stop --all-mine
+  rc_is 0 || fail "all-mine exit 0 (got $RC)"
+  [ "$(stop_calls)" -eq 0 ] || fail "all-mine: no stop call for a run already verified stopped"
+  [ ! -e "$d/$run.stop" ] || fail "all-mine: no marker for a run already verified stopped"
+  fake_has_name "other-$run-1" || fail "all-mine: the other prefix is left alone"
+  # A listed instance with one of the recorded names: the run is stopped again.
+  fake_start "agent-$run-1"
+  fan stop --all-mine
+  ! fake_has_name "agent-$run-1" || fail "all-mine: a listed instance with a recorded name is stopped"
+  [ -e "$d/$run.stop" ] || fail "all-mine: that run is not skipped (it gets a stop marker)"
+  fake_clear
+  # Pruning, whatever stop_verified says.
+  jq '.run_id = "'"$old_gone"'" | .instances[0].stop_verified = false' "$d/$run.json" >"$d/$old_gone.json"
+  jq '.run_id = "'"$old_live"'"' "$d/$run.json" >"$d/$old_live.json"
+  printf '{not json' >"$d/$old_bad.json"
+  : >"$d/$old_gone.stop"; : >"$d/$old_gone.pid"
+  touch -t 202001010000 "$d/$old_gone.json" "$d/$old_gone.stop" "$d/$old_gone.pid" "$d/$old_live.json" "$d/$old_bad.json"
+  fake_start "x-$old_live-1"
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  rc_is 0 || fail "start exit 0 (got $RC)"
+  [ ! -e "$d/$old_gone.json" ] && [ ! -e "$d/$old_gone.stop" ] && [ ! -e "$d/$old_gone.pid" ] ||
+    fail "old run with no listed instance: its files were deleted"
+  [ -e "$d/$old_live.json" ] || fail "old run with a listed instance: kept"
+  [ ! -e "$d/$old_bad.json" ] || fail "old unreadable record with no listed name: deleted"
+  [ -e "$d/$run.json" ] || fail "the recent record was kept"
+}
+
+# A listed instance that one list leaves out (list pages that shift) still gets
+# its stop call and is verified only when a list and get both say it is gone.
+t_seen_then_missing_from_one_list() {
+  local run lc u1
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 2
+  run="$(j .run_id)"
+  u1="$(j '.instances[0].uuid')"
+  lc="$(cat "$FAKE/list_count")"
+  # The first list of the stop rounds (preflight is lc+1) leaves instance 1 out once.
+  ENVX=("FAKE_GMSAAS_LIST_DROP_ONCE_1=$((lc + 2))")
+  fan stop --run "$run"
+  rc_is 0 || fail "once: exit 0 (got $RC)"
+  [ "$(count_calls " instances stop --no-wait $u1")" -ge 1 ] || fail "once: instance 1 got a stop call"
+  [ "$(count_calls " instances get $u1")" -ge 1 ] || fail "once: instance 1 checked with get"
+  fake_none || fail "once: no instance left (got $(fake_count))"
+  # Left out of every list of the stop, preflight included.
+  reset_logs
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 2
+  run="$(j .run_id)"
+  u1="$(j '.instances[0].uuid')"
+  lc="$(cat "$FAKE/list_count")"
+  ENVX=("FAKE_GMSAAS_LIST_DROP_1=$((lc + 1))")
+  fan stop --run "$run"
+  rc_is 0 || fail "always: exit 0 (got $RC)"
+  [ "$(count_calls " instances stop --no-wait $u1")" -ge 1 ] || fail "always: instance 1 got a stop call"
+  fake_none || fail "always: no instance left (got $(fake_count))"
+}
+
+HTML_404="API returns unexpected code: 404. Error: <HTML content, see logs for details>"
+
+# An HTML 404 (proxy or maintenance page) proves nothing.
+t_html_404_everywhere_not_verified() {
+  local run lc
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 2
+  run="$(j .run_id)"
+  lc="$(cat "$FAKE/list_count")"
+  ENVX=("FAKE_GMSAAS_LIST_FAIL_AFTER=$((lc + 1))" "FAKE_GMSAAS_STOP_UNAVAILABLE=1" "FAKE_GMSAAS_GET_UNAVAILABLE=1"
+        "FAKE_GMSAAS_API_ERROR_MESSAGE=$HTML_404")
+  fan stop --run "$run"
+  rc_is 6 || fail "everywhere: exit 6 (got $RC)"
+  jf '[.instances[].stop_verified] == [false, false]' "$(state_file "$run")" || fail "everywhere: nothing recorded as verified"
+  [ "$(fake_count)" -eq 2 ] || fail "everywhere: both instances still exist"
+  # Lists work, instance 1 is never listed, get answers an HTML 404: not verified.
+  fake_clear
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 2
+  run="$(j .run_id)"
+  lc="$(cat "$FAKE/list_count")"
+  ENVX=("FAKE_GMSAAS_LIST_DROP_1=$((lc + 1))" "FAKE_GMSAAS_GET_UNAVAILABLE=1" "FAKE_GMSAAS_API_ERROR_MESSAGE=$HTML_404")
+  fan stop --run "$run"
+  rc_is 6 || fail "get only: exit 6 (got $RC)"
+  jf '.instances[0].stop_verified == false' "$(state_file "$run")" || fail "get only: instance 1 not recorded as verified"
+}
+
+# A 5xx whose body merely contains the text "unexpected code: 404" proves nothing.
+t_404_text_inside_5xx_body_not_verified() {
+  local run lc
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  run="$(j .run_id)"
+  lc="$(cat "$FAKE/list_count")"
+  ENVX=("FAKE_GMSAAS_LIST_DROP_1=$((lc + 1))" "FAKE_GMSAAS_GET_UNAVAILABLE=1"
+        "FAKE_GMSAAS_API_ERROR_MESSAGE=API returns unexpected code: 503. Error: {\"detail\": \"upstream: API returns unexpected code: 404. Error: none\"}")
+  fan stop --run "$run"
+  rc_is 6 || fail "exit 6 (got $RC)"
+  jf '.instances[0].stop_verified == false' "$(state_file "$run")" || fail "not recorded as verified"
+}
+
+# A round whose list fails verifies nothing, even when get says 404.
+t_failed_list_round_verifies_nothing() {
+  local run lc
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  run="$(j .run_id)"
+  lc="$(cat "$FAKE/list_count")"
+  fake_clear
+  ENVX=("FAKE_GMSAAS_LIST_FAIL_AFTER=$((lc + 1))")
+  fan stop --run "$run"
+  rc_is 6 || fail "exit 6 (got $RC)"
+  jf '.instances[0].stop_verified == false' "$(state_file "$run")" || fail "not recorded as verified"
+}
+
+# get returning the state DELETED verifies, like a 404.
+t_get_deleted_state_verifies() {
+  local run
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  run="$(j .run_id)"
+  fake_clear
+  ENVX=("FAKE_GMSAAS_GET_DELETED_STATE=1")
+  fan stop --run "$run"
+  rc_is 0 || fail "exit 0 (got $RC)"
+  jf '.instances[0].stop_verified == true' "$(state_file "$run")" || fail "recorded as verified"
+  jt '.instances[0].status == "STOPPED"' || fail "STOPPED"
+}
+
+# A target not listed whose get fails: stop output gives UNVERIFIED, exit 6.
+t_stop_output_unverified() {
+  local run lc
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  run="$(j .run_id)"
+  lc="$(cat "$FAKE/list_count")"
+  ENVX=("FAKE_GMSAAS_LIST_DROP_1=$((lc + 1))" "FAKE_GMSAAS_STOP_UNAVAILABLE=1" "FAKE_GMSAAS_GET_UNAVAILABLE=1")
+  fan stop --run "$run"
+  rc_is 6 || fail "exit 6 (got $RC)"
+  jt '.instances[0].status == "UNVERIFIED"' || fail "UNVERIFIED (got: $(j '.instances[0].status'))"
+}
+
+# --all-mine while a start runs and its record has no UUID yet (the creation of
+# instance 1 is slow): the run is not skipped, the start tears itself down.
+t_all_mine_running_start_no_uuid_yet() {
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_CREATE_DELAY_1=3")
+  bg_start start --count 2
+  wait_calls_at_least ' instances start ' 1 || fail "start call 1 in flight"
+  sleep 1
+  ENVX=()
+  fan stop --all-mine
+  rc_is 0 || fail "stop --all-mine exit 0 (got $RC)"
+  bg_wait
+  rc_is 5 || fail "start exit 5 (got $RC)"
+  sleep 3   # past the slow creation, whatever the script did
+  fake_none || fail "no instance left (got $(fake_count))"
+}
+
+# A stale pid file whose pid is now an unrelated process, with a "ps" that has
+# no lstart: the process is not fanout.sh, so stop does not wait for it.
+t_stale_pid_without_lstart() {
+  local run psdir="$PROJ/.ps-broken" p decoy i
+  mkdir -p "$psdir"
+  printf '#!/bin/sh\nexit 1\n' >"$psdir/ps"
+  chmod +x "$psdir/ps"
+  p="$FAKES:$psdir:$TMPROOT/bashbin:/usr/bin:/bin"
+  [ "$(PATH="$p" command -v gmsaas)" = "$FAKES/gmsaas" ] || { fail "gmsaas resolves to the fake"; return 0; }
+  ENVX=("PATH=$p" "GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  run="$(j .run_id)"
+  sleep 60 &
+  decoy=$!
+  printf '%s\n' "$decoy" >"$PROJ/.genymotion/runs/$run.pid"
+  ENVX=("PATH=$p")
+  bg_start stop --run "$run"
+  for ((i = 0; i < 60; i++)); do kill -0 "$BG_PID" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$BG_PID" 2>/dev/null; then
+    fail "stop returned within 6 s"
+    kill -TERM "$BG_PID" 2>/dev/null
+  fi
+  bg_wait
+  kill "$decoy" 2>/dev/null; wait "$decoy" 2>/dev/null
+  rc_is 0 || fail "stop exit 0 (got $RC)"
+  fake_none || fail "no instance left (got $(fake_count))"
+}
+
+# A run record without "stop_verified" (an older format) is read by status,
+# stop and stop --all-mine, and the run is stopped and verified normally.
+t_old_format_record() {
+  local run1 run2 d="$PROJ/.genymotion/runs"
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  run1="$(j .run_id)"
+  fan start --count 1
+  run2="$(j .run_id)"
+  jq 'del(.instances[].stop_verified)' "$d/$run1.json" >"$d/$run1.old" && mv "$d/$run1.old" "$d/$run1.json"
+  jq 'del(.instances[].stop_verified)' "$d/$run2.json" >"$d/$run2.old" && mv "$d/$run2.old" "$d/$run2.json"
+  ENVX=()
+  fan status --run "$run1"
+  rc_is 0 || fail "status exit 0 (got $RC)"
+  jt '.instances[0].status == "ONLINE"' || fail "status ONLINE"
+  fan stop --run "$run1"
+  rc_is 0 || fail "stop exit 0 (got $RC)"
+  jf '.instances[0].stop_verified == true' "$d/$run1.json" || fail "stop: recorded as verified"
+  fan stop --all-mine
+  rc_is 0 || fail "all-mine exit 0 (got $RC)"
+  jf '.instances[0].stop_verified == true' "$d/$run2.json" || fail "all-mine: recorded as verified"
+  fake_none || fail "no instance left (got $(fake_count))"
 }
 
 # --- Runner --------------------------------------------------------------------
@@ -1155,6 +1706,33 @@ if selected t_crash_after_first_start; then (new_project; T_FAILED=0; t_crash_af
 if selected t_timeout_stopped_when_min_met; then (new_project; T_FAILED=0; t_timeout_stopped_when_min_met; end_test $?); report t_timeout_stopped_when_min_met $?; fi
 if selected t_second_signal_ignored_during_teardown; then (new_project; T_FAILED=0; t_second_signal_ignored_during_teardown; end_test $?); report t_second_signal_ignored_during_teardown $?; fi
 if selected t_no_auth_and_usage_errors; then (new_project; T_FAILED=0; t_no_auth_and_usage_errors; end_test $?); report t_no_auth_and_usage_errors $?; fi
+if selected t_stop_waits_across_time_zones; then (new_project; T_FAILED=0; t_stop_waits_across_time_zones; end_test $?); report t_stop_waits_across_time_zones $?; fi
+if selected t_unlisted_instance_stopped; then (new_project; T_FAILED=0; t_unlisted_instance_stopped; end_test $?); report t_unlisted_instance_stopped $?; fi
+if selected t_stop_during_api_outage; then (new_project; T_FAILED=0; t_stop_during_api_outage; end_test $?); report t_stop_during_api_outage $?; fi
+if selected t_unlisted_stop_transient_4; then (new_project; T_FAILED=0; t_unlisted_stop_transient_4; end_test $?); report t_unlisted_stop_transient_4 $?; fi
+if selected t_hidden_stop_verified_by_get; then (new_project; T_FAILED=0; t_hidden_stop_verified_by_get; end_test $?); report t_hidden_stop_verified_by_get $?; fi
+if selected t_stop_marker_kept_without_ps_lstart; then (new_project; T_FAILED=0; t_stop_marker_kept_without_ps_lstart; end_test $?); report t_stop_marker_kept_without_ps_lstart $?; fi
+if selected t_status_unlisted_not_stopped; then (new_project; T_FAILED=0; t_status_unlisted_not_stopped; end_test $?); report t_status_unlisted_not_stopped $?; fi
+if selected t_not_listed_yet_is_starting; then (new_project; T_FAILED=0; t_not_listed_yet_is_starting; end_test $?); report t_not_listed_yet_is_starting $?; fi
+if selected t_stop_marker_during_adb_phase; then (new_project; T_FAILED=0; t_stop_marker_during_adb_phase; end_test $?); report t_stop_marker_during_adb_phase $?; fi
+if selected t_all_mine_other_prefix_left_alone; then (new_project; T_FAILED=0; t_all_mine_other_prefix_left_alone; end_test $?); report t_all_mine_other_prefix_left_alone $?; fi
+if selected t_run_from_other_directory; then (new_project; T_FAILED=0; t_run_from_other_directory; end_test $?); report t_run_from_other_directory $?; fi
+if selected t_no_raw_bash_errors_on_stop; then (new_project; T_FAILED=0; t_no_raw_bash_errors_on_stop; end_test $?); report t_no_raw_bash_errors_on_stop $?; fi
+if selected t_adb_devices_hang_signal; then (new_project; T_FAILED=0; t_adb_devices_hang_signal; end_test $?); report t_adb_devices_hang_signal $?; fi
+if selected t_adb_devices_hang_bounded; then (new_project; T_FAILED=0; t_adb_devices_hang_bounded; end_test $?); report t_adb_devices_hang_bounded $?; fi
+if selected t_adb_key_in_start_output; then (new_project; T_FAILED=0; t_adb_key_in_start_output; end_test $?); report t_adb_key_in_start_output $?; fi
+if selected t_stopped_shown_as_stopping; then (new_project; T_FAILED=0; t_stopped_shown_as_stopping; end_test $?); report t_stopped_shown_as_stopping $?; fi
+if selected t_all_mine_reaches_running_start; then (new_project; T_FAILED=0; t_all_mine_reaches_running_start; end_test $?); report t_all_mine_reaches_running_start $?; fi
+if selected t_run_records_cleanup; then (new_project; T_FAILED=0; t_run_records_cleanup; end_test $?); report t_run_records_cleanup $?; fi
+if selected t_seen_then_missing_from_one_list; then (new_project; T_FAILED=0; t_seen_then_missing_from_one_list; end_test $?); report t_seen_then_missing_from_one_list $?; fi
+if selected t_html_404_everywhere_not_verified; then (new_project; T_FAILED=0; t_html_404_everywhere_not_verified; end_test $?); report t_html_404_everywhere_not_verified $?; fi
+if selected t_404_text_inside_5xx_body_not_verified; then (new_project; T_FAILED=0; t_404_text_inside_5xx_body_not_verified; end_test $?); report t_404_text_inside_5xx_body_not_verified $?; fi
+if selected t_failed_list_round_verifies_nothing; then (new_project; T_FAILED=0; t_failed_list_round_verifies_nothing; end_test $?); report t_failed_list_round_verifies_nothing $?; fi
+if selected t_get_deleted_state_verifies; then (new_project; T_FAILED=0; t_get_deleted_state_verifies; end_test $?); report t_get_deleted_state_verifies $?; fi
+if selected t_stop_output_unverified; then (new_project; T_FAILED=0; t_stop_output_unverified; end_test $?); report t_stop_output_unverified $?; fi
+if selected t_all_mine_running_start_no_uuid_yet; then (new_project; T_FAILED=0; t_all_mine_running_start_no_uuid_yet; end_test $?); report t_all_mine_running_start_no_uuid_yet $?; fi
+if selected t_stale_pid_without_lstart; then (new_project; T_FAILED=0; t_stale_pid_without_lstart; end_test $?); report t_stale_pid_without_lstart $?; fi
+if selected t_old_format_record; then (new_project; T_FAILED=0; t_old_format_record; end_test $?); report t_old_format_record $?; fi
 
 echo "----"
 echo "$pass passed, $failed failed, $skipped skipped"

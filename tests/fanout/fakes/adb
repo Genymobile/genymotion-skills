@@ -3,7 +3,9 @@
 # "adb devices" prints the real header, then one "<serial><TAB><state>" line per
 # fake instance whose ADB tunnel is connected (state "offline" for the
 # "adboffline" behaviour, "device" otherwise).
-# Knob: FAKE_ADB_NEEDS_START=1 prints no device until "gmsaas adb start" ran.
+# Knobs: FAKE_ADB_NEEDS_START=1 prints no device until "gmsaas adb start" ran.
+#        FAKE_ADB_HANG=<s>       "adb devices" hangs <s> seconds before answering.
+#        FAKE_ADB_HANG_ONCE=<s>  only the first "adb devices" hangs <s> seconds.
 set -euo pipefail
 
 : "${FAKE_GMSAAS_DIR:?FAKE_GMSAAS_DIR must point to the fake state directory}"
@@ -11,6 +13,11 @@ printf '%s\n' "$*" >>"$FAKE_GMSAAS_DIR/adb_calls.log"
 
 case "${1:-}" in
   devices)
+    if [ -n "${FAKE_ADB_HANG:-}" ]; then sleep "$FAKE_ADB_HANG"; fi
+    if [ -n "${FAKE_ADB_HANG_ONCE:-}" ] && [ ! -e "$FAKE_GMSAAS_DIR/adb_hung" ]; then
+      touch "$FAKE_GMSAAS_DIR/adb_hung"
+      sleep "$FAKE_ADB_HANG_ONCE"
+    fi
     echo "List of devices attached"
     if [ "${FAKE_ADB_NEEDS_START:-}" = "1" ] && [ ! -e "$FAKE_GMSAAS_DIR/adb_started" ]; then
       echo

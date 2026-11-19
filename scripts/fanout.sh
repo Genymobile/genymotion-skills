@@ -11,7 +11,11 @@
 if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] ||
   { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 4 ]; }; then
   echo "fanout.sh: Bash 4.4 or later is required (found ${BASH_VERSION:-unknown}). On macOS: brew install bash" >&2
-  printf '%s\n' '{"run_id": null, "instances": [], "error": "Bash 4.4 or later is required"}'
+  if [ "${1:-}" = "start" ]; then
+    printf '%s\n' '{"run_id": null, "adb": null, "instances": [], "error": "Bash 4.4 or later is required"}'
+  else
+    printf '%s\n' '{"run_id": null, "instances": [], "error": "Bash 4.4 or later is required"}'
+  fi
   exit 2
 fi
 
@@ -29,6 +33,8 @@ readonly MAX_EXTRA_PORTS=20     # busy ADB ports skipped at most per run
 readonly ADB_CHECKS=5           # "adb devices" checks at most
 readonly START_CALL_WAIT=40     # seconds a signal handler waits for an in-flight start call
 readonly ACTIVE_START_WAIT=240  # seconds "stop" waits for a running "start" of the same run
+readonly ADB_DEVICES_TIMEOUT=20 # seconds an "adb devices" check may take before it is killed
+readonly RECORD_MAX_AGE_DAYS=30 # records of runs verified stopped are deleted after this
 readonly DEFAULT_DURATION=60    # minutes
 readonly DEFAULT_MAX_INSTANCES=5
 readonly DEFAULT_PREFIX=agent
@@ -37,7 +43,8 @@ readonly DEFAULT_POLL_INTERVAL=30
 readonly DEFAULT_STOP_POLL_INTERVAL=10
 readonly STARTING_STATES=" CREATING STARTING OFFLINE BOOTING UNKNOWN "
 # States of an instance on its way out (gmsaas). A stop is not re-issued for them.
-readonly LEAVING_STATES=" STOPPING STOPPED OFFLINE DELETING "
+# OFFLINE is also a starting state: a stop is re-issued for it (harmless).
+readonly LEAVING_STATES=" STOPPING STOPPED DELETING "
 readonly FAILURE_STATUSES=" START_FAILED BOOT_FAILED TIMEOUT ADB_FAILED "
 readonly UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 readonly RUN_ID_RE='^[0-9]{14}-[0-9a-f]{8}$'
@@ -56,7 +63,7 @@ OUTPUT_DONE=0       # the one JSON object was printed (or its printing was attem
 START_ACTIVE=0      # a start is in progress: any abnormal exit must tear it down
 STARTED_ANY=0       # a start call was issued
 SLEEP_PID=""
-GM_PID="" GM_KIND="" GM_INDEX=""
+GM_PID="" GM_KIND="" GM_INDEX="" ADB_PID="" ADB_WD=""
 WORK_DIR=""
 PID_FILE=""
 HAVE_JQ=0
@@ -65,11 +72,17 @@ PREFIX="" RECIPE="" DURATION="" COUNT="" MIN="" BASE_PORT="" MAX_INSTANCES=""
 POLL_INTERVAL="" STOP_POLL_INTERVAL=""
 GM_OUT="" GM_RC=0 GM_ERR_MSG=""
 # Instances (index i is instance number i+1 for start). E_RUN: run id of the entry (stop only).
-I_NAME=() I_UUID=() I_SERIAL=() I_STATUS=() I_LIVE=() E_RUN=()
+# I_VSTOP: 1 when the stop of the entry was verified (recorded as "stop_verified").
+# I_SEEN: 1 once the instance appeared in a list (start only).
+I_NAME=() I_UUID=() I_SERIAL=() I_STATUS=() I_LIVE=() E_RUN=() I_VSTOP=() I_SEEN=()
 declare -A LIVE_STATE=() LIVE_SERIAL=() LIVE_BY_NAME=()
 LIVE_VALID=0        # the last live_list succeeded
 STOP_REMAINING=()
 declare -A STOP_TARGETS=()  # UUIDs handled by the last stop_and_verify
+declare -A STOP_GONE=()     # UUIDs the last stop_and_verify verified gone
+declare -A KNOWN_GONE=()    # UUIDs a run record already gives as verified stopped
+declare -A STOP_OBS=()      # last state the last stop_and_verify saw for a target
+GET_STATE=""
 
 # Progress goes to standard error. A closed or broken stderr never fails the script.
 log() { printf 'fanout: %s\n' "$*" >&2 2>/dev/null || true; }
@@ -77,14 +90,28 @@ log() { printf 'fanout: %s\n' "$*" >&2 2>/dev/null || true; }
 # ---------------------------------------------------------------------------
 # Output and exit — every exit goes through finish(), which prints the JSON once.
 # ---------------------------------------------------------------------------
-instances_json() { # [run-id]: only the entries of that run (stop)
+instances_json() { # the "instances" array of the output
+  local i
+  {
+    for i in "${!I_NAME[@]}"; do
+      jq -cn --arg n "${I_NAME[i]}" --arg u "${I_UUID[i]}" --arg s "${I_SERIAL[i]}" --arg st "${I_STATUS[i]}" \
+        '{name: $n, uuid: (if $u == "" then null else $u end),
+          serial: (if $s == "" or $st != "ONLINE" then null else $s end), status: $st}'
+    done
+  } | jq -cs '.'
+}
+
+# The run record: the four output keys plus "stop_verified".
+record_json() { # [run-id]
   local i
   {
     for i in "${!I_NAME[@]}"; do
       if [ -n "${1:-}" ] && [ "${E_RUN[i]:-}" != "$1" ]; then continue; fi
       jq -cn --arg n "${I_NAME[i]}" --arg u "${I_UUID[i]}" --arg s "${I_SERIAL[i]}" --arg st "${I_STATUS[i]}" \
+        --arg v "${I_VSTOP[i]:-0}" \
         '{name: $n, uuid: (if $u == "" then null else $u end),
-          serial: (if $s == "" or $st != "ONLINE" then null else $s end), status: $st}'
+          serial: (if $s == "" or $st != "ONLINE" then null else $s end), status: $st,
+          stop_verified: ($v == "1")}'
     done
   } | jq -cs '.'
 }
@@ -103,13 +130,24 @@ emit() { # error-message (empty for success)
   [ "$OUTPUT_DONE" -eq 0 ] || return 0
   OUTPUT_DONE=1
   if [ "$HAVE_JQ" -eq 0 ]; then
-    json="{\"run_id\": null, \"instances\": [], \"error\": \"$(json_escape "$err")\"}"
+    if [ "$CMD" = "start" ]; then
+      json="{\"run_id\": null, \"adb\": null, \"instances\": [], \"error\": \"$(json_escape "$err")\"}"
+    else
+      json="{\"run_id\": null, \"instances\": [], \"error\": \"$(json_escape "$err")\"}"
+    fi
   else
     inst="$(instances_json)" || inst='[]'
+    # "adb" is in the output of start only: the adb the script used, or null.
     json="$(jq -cn --arg run "$RUN_ID" --argjson inst "$inst" --arg err "$err" \
-      '{run_id: (if $run == "" then null else $run end), instances: $inst}
+      --arg cmd "$CMD" --arg adb "$ADB_BIN" \
+      '{run_id: (if $run == "" then null else $run end)}
+       + (if $cmd == "start" then {adb: (if $adb == "" then null else $adb end)} else {} end)
+       + {instances: $inst}
        + (if $err == "" then {} else {error: $err} end)')" ||
       json='{"run_id": null, "instances": [], "error": "internal error while printing the result"}'
+    if [ "$CMD" = "start" ] && [[ "$json" != *'"adb"'* ]]; then
+      json='{"run_id": null, "adb": null, "instances": [], "error": "internal error while printing the result"}'
+    fi
   fi
   printf '%s\n' "$json" 2>/dev/null
 }
@@ -138,7 +176,7 @@ finish() { # exit-code [error-message]
 
 # finish() for exit 2 also clears the instance list: nothing was started.
 config_error() {
-  I_NAME=() I_UUID=() I_SERIAL=() I_STATUS=()
+  I_NAME=() I_UUID=() I_SERIAL=() I_STATUS=() I_VSTOP=() E_RUN=()
   finish 2 "$1"
 }
 
@@ -164,6 +202,8 @@ nap() {
 # must be known so it can be stopped. Any other call is killed.
 settle_gm_call() {
   local k u
+  if [ -n "$ADB_PID" ]; then kill "$ADB_PID" 2>/dev/null || true; ADB_PID=""; fi
+  if [ -n "$ADB_WD" ]; then kill "$ADB_WD" 2>/dev/null || true; ADB_WD=""; fi
   # A signal between the launch and "GM_PID=$!" leaves GM_PID empty: take the job.
   if [ -z "$GM_PID" ] && [ "$GM_KIND" = "instances start" ]; then
     GM_PID="$(jobs -p | tail -n 1)"
@@ -194,9 +234,31 @@ settle_gm_call() {
 teardown_and_finish() { # code reason
   trap '' INT TERM HUP
   if teardown_run_all; then
-    finish "$1" "$2; every instance of the run was stopped"
+    finish "$1" "$2; $(teardown_summary)"
   fi
-  finish 6 "$2; ${#STOP_REMAINING[@]} instance(s) still running after the teardown: run 'fanout.sh stop --run $RUN_ID', then check https://cloud.geny.io/instances"
+  finish 6 "$2; $(not_verified_message)"
+}
+
+# The one wording of an incomplete stop (exit 6), for start and stop.
+not_verified_message() {
+  local again="fanout.sh stop --run $RUN_ID"
+  [ -n "$RUN_ID" ] || again="fanout.sh stop --all-mine"
+  printf '%s instance(s) not verified stopped: run %s again, then check https://cloud.geny.io/instances' \
+    "${#STOP_REMAINING[@]}" "'$again'"
+}
+
+# What a verified teardown of the run proves.
+teardown_summary() {
+  local i blind=0
+  for i in "${!I_NAME[@]}"; do
+    if [ "${I_STATUS[i]}" = "START_FAILED" ] && [ -z "${I_UUID[i]}" ]; then blind=$((blind + 1)); fi
+  done
+  if [ "$blind" -eq 0 ]; then
+    printf 'every instance of the run was stopped'
+  else
+    printf "every instance of the run that gmsaas returned or listed was stopped; %d failed start call(s) may still have created an instance: run 'fanout.sh stop --run %s' when you are done" \
+      "$blind" "$RUN_ID"
+  fi
 }
 
 on_signal() { # signal-name exit-code
@@ -230,10 +292,10 @@ on_exit() {
       warn_unlisted_start_failures
       if teardown_run_all; then
         rc=5
-        emit "internal error (exit code $orig); every instance of the run was stopped"
+        emit "internal error (exit code $orig); $(teardown_summary)"
       else
         rc=6
-        emit "internal error (exit code $orig); ${#STOP_REMAINING[@]} instance(s) still running: run 'fanout.sh stop --run $RUN_ID', then check https://cloud.geny.io/instances"
+        emit "internal error (exit code $orig); $(not_verified_message)"
       fi
     else
       rc=2
@@ -285,8 +347,10 @@ Commands:
   status              Live state and serial of each instance of a run (default: the most recent run).
   stop                Stop every instance of a run (default: the most recent run), then verify.
                       A start still running for that run tears itself down (exit 5).
-  stop --all-mine     Stop every recorded run and every running instance named
-                      <prefix>-<run-id>-<index>, then verify.
+                      With --run and no record of the run here, the instances are found by
+                      their names (<any prefix>-<run-id>-<index>) in the account.
+  stop --all-mine     Stop every run recorded here with the configured prefix, and every running
+                      instance named <prefix>-<run-id>-<index>, then verify. Other prefixes are left alone.
 
 Settings (flag > environment variable > .genymotion.json key > default):
   --recipe            GENYMOTION_SAAS_RECIPE / saasRecipe (default: none, required). A recipe UUID or a name from "recipes".
@@ -303,21 +367,34 @@ Settings (flag > environment variable > .genymotion.json key > default):
   The API token is read by gmsaas itself.
 
 Output (standard output, one JSON object):
-  {"run_id": "...", "instances": [{"name", "uuid", "serial", "status"}], "error": "..." (only when the exit code is not 0)}
-  status: ONLINE, START_FAILED, BOOT_FAILED, TIMEOUT, ADB_FAILED, STOPPED, or a live gmsaas state (status and stop only).
+  {"run_id": "...", "adb": "<path>" (start only), "instances": [{"name", "uuid", "serial", "status"}],
+   "error": "..." (only when the exit code is not 0)}
+  adb: the adb start used (null when it did not get that far). Use the same adb for your own commands.
+  status: ONLINE, START_FAILED, BOOT_FAILED, TIMEOUT, ADB_FAILED, STOPPED (stopped and verified: not
+          listed, and gmsaas instances get reports it deleted or not found), UNVERIFIED (status and stop
+          only: not listed, and gmsaas could not say whether it still exists), or a live gmsaas state
+          (status and stop only; gmsaas STOPPED is shown as STOPPING).
 
 Exit codes:
-  0    success: start has at least --min usable instances; stop verified; status printed
-  1    partial: some instances came up, but fewer than --min; everything was stopped
+  0    success: start has at least --min usable instances; stop verified, nothing is running; status printed
+  1    partial: start: some instances came up, but fewer than --min; everything was stopped
   2    configuration: bad flag, missing or invalid setting, count above the cap, jq / adb / gmsaas not found,
-       or a project directory that cannot be written; nothing was started
-  3    gmsaas failed: not authenticated, API or network error, or no instance could be created
-  4    timeout: no instance usable and at least one still starting after the last poll; everything was stopped
-  5    failed: no instance usable, a stop was requested for the run, the result could not be printed,
-       or an internal error; everything was stopped
-  6    stop incomplete: at least one instance is still running; run stop again, then check https://cloud.geny.io/instances
+       a project directory that cannot be written, (status) a run file that cannot be read, or
+       (stop --run, status --run) a run id with no record here and no instance in the account;
+       nothing was started
+  3    gmsaas failed: not authenticated, Android SDK path not set, API or network error, or no instance
+       could be created; also for stop and status when the instances cannot be listed
+  4    timeout: start: no instance usable and at least one still starting after the last poll;
+       everything was stopped
+  5    failed: start: no instance usable (boot or ADB failures), the stop of a failed instance could not
+       be verified at first, a stop was requested for this run, the result could not be printed, or an
+       internal error; everything was stopped, healthy instances included
+  6    stop incomplete: at least one instance is still running after stop; run stop again, then check
+       https://cloud.geny.io/instances
   129, 130, 143  interrupted (hang-up, Ctrl-C, termination): start stopped everything it had started
-  A non-zero exit code from start means that nothing is left running, except 6.
+  A non-zero exit code from start means that every instance it created was stopped, except 6.
+  Always run "fanout.sh stop --run <run-id>" at the end: it also stops an instance whose start call
+  failed and that was listed too late.
 
 Examples:
   RESULT="\$(fanout.sh start --count 3 --recipe phone)"
@@ -565,63 +642,137 @@ stop_call() { # uuid
   if [ "$GM_RC" -eq 0 ]; then log "stopping $1"; else log "stop $1: $GM_ERR_MSG"; fi
 }
 
-# stop_and_verify UUID...: stop each listed one with --no-wait, then check up to
-# STOP_POLLS times until none is listed (or listed as DELETED). A stop is issued
-# again for an instance that is still listed and not on its way out.
-# Sets STOP_REMAINING to the UUIDs still running. Returns 0 when none is.
+# Live state as this script reports it: gmsaas "STOPPED" (still listed) is shown
+# as STOPPING, because STOPPED here always means verified gone.
+shown_state() { if [ "$1" = "STOPPED" ]; then printf 'STOPPING'; else printf '%s' "$1"; fi; }
+
+# Existence of one instance, asked with "instances get". Sets GET_STATE and returns:
+#   0  it exists (GET_STATE: its gmsaas state)
+#   1  it no longer exists: an API error 404 with a gmsaas (non-HTML) body, or
+#      the state DELETED
+#   2  unknown: any other failure. gmsaas gives exit 4 for every HTTP status, and
+#      replaces an HTML body (proxy, maintenance page) with "<HTML content":
+#      such a 404 proves nothing.
+instance_exists() { # uuid
+  local not_found='^API returns unexpected code: 404\. Error: '
+  GET_STATE=""
+  gm instances get "$1"
+  if [ "$GM_RC" -eq 0 ]; then
+    GET_STATE="$(jq -r '.instance.state // empty' <<<"$GM_OUT")" || GET_STATE=""
+    if [ "$GET_STATE" = "DELETED" ]; then return 1; fi
+    [ -n "$GET_STATE" ] || return 2
+    return 0
+  fi
+  if [ "$GM_RC" -eq 4 ] && [[ "$GM_ERR_MSG" =~ $not_found ]] && [[ "$GM_ERR_MSG" != *"<HTML content"* ]]; then
+    return 1
+  fi
+  return 2
+}
+
+# stop_and_verify UUID...: stop every target, then verify.
+# - A stop call goes to every target, except one its run record already gives as
+#   verified stopped (KNOWN_GONE). Its outcome proves nothing.
+# - A target is verified stopped only when, in the same round, a successful
+#   "instances list" does not show it (or shows it DELETED) AND "instances get"
+#   says it no longer exists (instance_exists returns 1). A round whose list
+#   fails verifies nothing.
+# - A stop is sent again to a target that still exists and is not on its way
+#   out, and to a target whose last stop call failed.
+# Each round: 1 list, plus 1 get for each target the list does not show, plus a
+# stop for the targets above. STOP_POLLS rounds at most, STOP_POLL_INTERVAL
+# seconds apart. Sets STOP_GONE (verified), STOP_OBS (last state seen: a gmsaas
+# state, or UNVERIFIED) and STOP_REMAINING (not verified).
+# Returns 0 when every target is verified stopped.
 stop_and_verify() {
-  local u p listed=1
+  local u p rc
   local -a targets=() remaining=() still=()
+  declare -A stop_ok=()
   for u in "$@"; do [ -z "$u" ] || targets+=("$u"); done
-  STOP_REMAINING=() STOP_TARGETS=()
+  STOP_REMAINING=() STOP_TARGETS=() STOP_GONE=() STOP_OBS=()
   [ "${#targets[@]}" -gt 0 ] || return 0
   for u in "${targets[@]}"; do STOP_TARGETS["$u"]=1; done
-  if ! live_list; then
-    listed=0
-    log "cannot list instances before stopping ($GM_ERR_MSG): stopping every target"
-  fi
   for u in "${targets[@]}"; do
-    if [ "$listed" -eq 1 ] && ! is_alive "$u"; then continue; fi
+    if [ -n "${KNOWN_GONE[$u]+x}" ]; then
+      STOP_GONE["$u"]=1
+      continue
+    fi
     stop_call "$u"
+    if [ "$GM_RC" -eq 0 ]; then stop_ok["$u"]=1; fi
     remaining+=("$u")
   done
-  [ "${#remaining[@]}" -gt 0 ] || return 0
   for ((p = 1; p <= STOP_POLLS; p++)); do
-    if live_list; then
-      still=()
+    [ "${#remaining[@]}" -gt 0 ] || return 0
+    if [ "$p" -gt 1 ]; then nap "$STOP_POLL_INTERVAL"; fi
+    if ! live_list; then
+      log "stop check $p/$STOP_POLLS: cannot list instances ($GM_ERR_MSG): nothing verified in this round"
       for u in "${remaining[@]}"; do
-        is_alive "$u" || continue
-        still+=("$u")
-        if [[ "$LEAVING_STATES" != *" ${LIVE_STATE[$u]} "* ]]; then
-          log "$u is still ${LIVE_STATE[$u]}: stopping it again"
+        if [ -z "${stop_ok[$u]+x}" ]; then
           stop_call "$u"
+          if [ "$GM_RC" -eq 0 ]; then stop_ok["$u"]=1; fi
         fi
       done
-      remaining=("${still[@]}")
-      [ "${#remaining[@]}" -gt 0 ] || return 0
-    else
-      log "stop check $p/$STOP_POLLS: cannot list instances ($GM_ERR_MSG)"
+      continue
     fi
-    if [ "$p" -lt "$STOP_POLLS" ]; then nap "$STOP_POLL_INTERVAL"; fi
+    still=()
+    for u in "${remaining[@]}"; do
+      if is_alive "$u"; then
+        STOP_OBS["$u"]="${LIVE_STATE[$u]}"
+        still+=("$u")
+        if [[ "$LEAVING_STATES" != *" ${LIVE_STATE[$u]} "* ]] || [ -z "${stop_ok[$u]+x}" ]; then
+          log "$u is still ${LIVE_STATE[$u]}: stopping it again"
+          stop_call "$u"
+          if [ "$GM_RC" -eq 0 ]; then stop_ok["$u"]=1; fi
+        fi
+        continue
+      fi
+      # Not listed in this round: gmsaas must also say it no longer exists.
+      rc=0
+      instance_exists "$u" || rc=$?
+      if [ "$rc" -eq 1 ]; then
+        log "$u: not listed, and gmsaas instances get says it no longer exists"
+        STOP_GONE["$u"]=1
+        continue
+      fi
+      still+=("$u")
+      if [ "$rc" -eq 0 ]; then
+        STOP_OBS["$u"]="$GET_STATE"
+        if [[ "$LEAVING_STATES" != *" $GET_STATE "* ]] || [ -z "${stop_ok[$u]+x}" ]; then
+          log "$u is not listed but still $GET_STATE: stopping it again"
+          stop_call "$u"
+          if [ "$GM_RC" -eq 0 ]; then stop_ok["$u"]=1; fi
+        fi
+      else
+        STOP_OBS["$u"]="UNVERIFIED"
+        log "$u: not listed, and gmsaas cannot tell whether it still exists ($GM_ERR_MSG)"
+        if [ -z "${stop_ok[$u]+x}" ]; then
+          stop_call "$u"
+          if [ "$GM_RC" -eq 0 ]; then stop_ok["$u"]=1; fi
+        fi
+      fi
+    done
+    remaining=("${still[@]}")
   done
+  [ "${#remaining[@]}" -gt 0 ] || return 0
   STOP_REMAINING=("${remaining[@]}")
-  log "${#STOP_REMAINING[@]} instance(s) still running after $STOP_POLLS checks: ${STOP_REMAINING[*]}"
+  log "${#STOP_REMAINING[@]} instance(s) not verified stopped after $STOP_POLLS checks: ${STOP_REMAINING[*]}"
   return 1
 }
 
-# After stop_and_verify: each instance it targeted becomes STOPPED once verified
-# gone (unless it carries a failure status), or takes its live state otherwise.
+# After stop_and_verify: each target verified gone becomes STOPPED (unless it
+# carries a failure status) and is recorded as stop_verified; any other target
+# takes the last state seen (UNVERIFIED when gmsaas could not tell).
 mark_stopped() {
-  local i u r still
+  local i u
   for i in "${!I_NAME[@]}"; do
     u="${I_UUID[i]}"
     [ -n "$u" ] && [ -n "${STOP_TARGETS[$u]+x}" ] || continue
-    still=0
-    for r in "${STOP_REMAINING[@]}"; do [ "$r" != "$u" ] || still=1; done
-    if [ "$still" -eq 1 ]; then
-      I_STATUS[i]="${LIVE_STATE[$u]:-${I_STATUS[i]}}"
+    if [ -n "${STOP_GONE[$u]+x}" ]; then
+      I_VSTOP[i]=1
+      is_failure_status "${I_STATUS[i]}" || I_STATUS[i]="STOPPED"
+    elif [ -n "${STOP_OBS[$u]+x}" ]; then
+      I_STATUS[i]="$(shown_state "${STOP_OBS[$u]}")"
     elif ! is_failure_status "${I_STATUS[i]}"; then
-      I_STATUS[i]="STOPPED"
+      I_STATUS[i]="UNVERIFIED"   # no round could observe it
     fi
   done
 }
@@ -634,11 +785,35 @@ refresh_from_live() {
     u="${I_UUID[i]}"
     [ -n "$u" ] || continue
     if is_alive "$u"; then
-      I_STATUS[i]="${LIVE_STATE[$u]}"
-    elif ! is_failure_status "${I_STATUS[i]}"; then
-      I_STATUS[i]="STOPPED"
+      I_STATUS[i]="$(shown_state "${LIVE_STATE[$u]}")"
+    elif [ -n "${STOP_GONE[$u]+x}" ]; then
+      I_VSTOP[i]=1
+      is_failure_status "${I_STATUS[i]}" || I_STATUS[i]="STOPPED"
+    elif [ "${STOP_OBS[$u]:-}" = "UNVERIFIED" ]; then
+      is_failure_status "${I_STATUS[i]}" || I_STATUS[i]="UNVERIFIED"
+    else
+      resolve_unlisted "$i"
     fi
   done
+}
+
+# Status of an entry the last successful list does not show: STOPPED only when
+# verified (the record says so, or "instances get" reports it no longer exists:
+# with the list, the same proof as in stop); its gmsaas state when it still
+# exists; UNVERIFIED when gmsaas cannot tell. A failure status is kept when the
+# instance is gone or unknown. Read-only: never a stop call.
+resolve_unlisted() { # index
+  local i="$1" u="${I_UUID[$1]}" rc=0
+  if [ "${I_VSTOP[i]:-0}" = "1" ]; then
+    is_failure_status "${I_STATUS[i]}" || I_STATUS[i]="STOPPED"
+    return 0
+  fi
+  instance_exists "$u" || rc=$?
+  case "$rc" in
+    0) I_STATUS[i]="$(shown_state "$GET_STATE")" ;;
+    1) is_failure_status "${I_STATUS[i]}" || I_STATUS[i]="STOPPED" ;;
+    *) is_failure_status "${I_STATUS[i]}" || I_STATUS[i]="UNVERIFIED" ;;
+  esac
 }
 
 # An entry without a UUID (start killed during its start call, or a failed start
@@ -684,7 +859,7 @@ write_json_file() { # path json
 
 save_run() { # path [run-id]: replaces .instances, keeps the other keys
   local inst new
-  inst="$(instances_json "${2:-}")" || return 1
+  inst="$(record_json "${2:-}")" || return 1
   new="$(jq --argjson inst "$inst" '.instances = $inst' "$1")" || return 1
   write_json_file "$1" "$new"
 }
@@ -694,11 +869,26 @@ valid_run_file() {
 }
 
 load_run() { # path [run-id] -> appends to the I_* arrays; returns 1 when the file is unreadable
-  local n u s st
+  local n u s st v
   valid_run_file "$1" || return 1
-  while IFS=$'\x1f' read -r n u s st _; do
-    I_NAME+=("$n") I_UUID+=("$u") I_SERIAL+=("$s") I_STATUS+=("$st") E_RUN+=("${2:-}")
-  done < <(jq -r '.instances[] | [(.name // ""), (.uuid // ""), (.serial // ""), (.status // ""), "."] | map(tostring) | join("\u001f")' "$1")
+  while IFS=$'\x1f' read -r n u s st v _; do
+    I_NAME+=("$n") I_UUID+=("$u") I_SERIAL+=("$s") I_STATUS+=("$st") E_RUN+=("${2:-}") I_VSTOP+=("$v")
+    if [ "$v" = "1" ] && [ -n "$u" ]; then KNOWN_GONE["$u"]=1; fi
+  done < <(jq -r '.instances[] | [(.name // ""), (.uuid // ""), (.serial // ""), (.status // ""),
+    (if .stop_verified == true then "1" else "0" end), "."] | map(tostring) | join("\u001f")' "$1")
+}
+
+# A run record whose every entry is in a final status, and whose every entry
+# with a UUID is recorded as verified stopped.
+run_fully_stopped() { # path
+  jq -e '(.instances | type == "array")
+    and all(.instances[]; (.status // "") as $s
+      | ["STOPPED", "START_FAILED", "BOOT_FAILED", "TIMEOUT", "ADB_FAILED"] | index($s) != null)
+    and all(.instances[] | select(.uuid != null); .stop_verified == true)' "$1" >/dev/null 2>&1
+}
+
+record_prefix() { # path -> the recorded prefix, or empty
+  jq -r '.prefix // empty | tostring' "$1" 2>/dev/null || true
 }
 
 latest_run_id() {
@@ -713,9 +903,8 @@ latest_run_id() {
   printf '%s' "$best"
 }
 
-check_run_flag() { # run-id
+check_run_flag() { # run-id (a run with no record here is looked up by name later)
   [[ "$1" =~ $RUN_ID_RE ]] || config_error "invalid run id '$1': expected YYYYMMDDHHMMSS-xxxxxxxx, as printed by start"
-  [ -e "$(state_file "$1")" ] || config_error "unknown run '$1': no $RUNS_DIR/$1.json"
 }
 
 # Start time of a process, as "ps" prints it (procps and BSD ps both know lstart).
@@ -726,13 +915,28 @@ proc_start_time() { # pid
 
 # PID of a start still running for this run, or empty. The pid file holds the
 # pid and the process start time: a reused pid has another start time.
+# The pid file is removed by start itself when it exits; stop never removes it.
 active_start_pid() { # run-id
   local pid="" started="" now
-  { IFS= read -r pid; IFS= read -r started; } <"$(pid_file "$1")" 2>/dev/null || true
-  [[ "$pid" =~ ^[0-9]+$ ]] && [ -n "$started" ] || return 0
+  [ -r "$(pid_file "$1")" ] || return 0
+  { IFS= read -r pid; IFS= read -r started; } 2>/dev/null <"$(pid_file "$1")" || true
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
   kill -0 "$pid" 2>/dev/null || return 0
-  now="$(proc_start_time "$pid")" || return 0
-  [ "$now" = "$started" ] || return 0
+  now="$(proc_start_time "$pid")" || now=""
+  # Two known start times: equal means the start, different means pid reuse.
+  if [ -n "$started" ] && [ -n "$now" ]; then
+    [ "$now" = "$started" ] || return 0
+    printf '%s' "$pid"
+    return 0
+  fi
+  # Start time unknown ("ps" without lstart): the pid is the start only if the
+  # process runs fanout.sh; when even that cannot be read, count it as the start.
+  local args=""
+  if [ -r "/proc/$pid/cmdline" ]; then
+    args="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)" || args=""
+  fi
+  if [ -z "$args" ]; then args="$(ps -o args= -p "$pid" 2>/dev/null)" || args=""; fi
+  if [ -n "$args" ] && [[ "$args" != *fanout.sh* ]]; then return 0; fi
   printf '%s' "$pid"
 }
 
@@ -762,6 +966,48 @@ prepare_runs_dir() {
   rm -f "$probe"
 }
 
+# A listed instance belongs to the run: a recorded UUID, or a name ending in
+# -<run-id>-<index>. Uses the last live_list.
+run_has_listed_instance() { # run-id record-path
+  local n u re="-${1}-[0-9]+\$"
+  for n in "${!LIVE_BY_NAME[@]}"; do
+    if [[ "$n" =~ $re ]] && is_alive "${LIVE_BY_NAME[$n]}"; then return 0; fi
+  done
+  if valid_run_file "$2"; then
+    while IFS= read -r u; do
+      if is_alive "$u"; then return 0; fi
+    done < <(jq -r '.instances[] | .uuid // empty' "$2")
+  fi
+  return 1
+}
+
+# A listed instance carries one of the names recorded in the run record.
+run_name_listed() { # record-path
+  local n
+  while IFS= read -r n; do
+    if [ -n "$n" ] && [ -n "${LIVE_BY_NAME[$n]+x}" ] && is_alive "${LIVE_BY_NAME[$n]}"; then return 0; fi
+  done < <(jq -r '.instances[] | .name // empty' "$1" 2>/dev/null)
+  return 1
+}
+
+# The files of a run (.json, .stop, .pid) are deleted when its record is more
+# than RECORD_MAX_AGE_DAYS days old and the preflight list shows no instance of
+# that run. An instance cannot run longer than 28800 minutes (20 days).
+# Old .stop and .pid files without a record go too. Needs the preflight list.
+prune_old_records() {
+  local f id
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    id="$(basename "$f")"; id="${id%.*}"
+    [[ "$id" =~ $RUN_ID_RE ]] || continue
+    if [ "${f##*.}" != "json" ] && [ -e "$(state_file "$id")" ]; then continue; fi
+    if run_has_listed_instance "$id" "$(state_file "$id")"; then continue; fi
+    rm -f "$(state_file "$id")" "$(stop_marker "$id")" "$(pid_file "$id")" 2>/dev/null || true
+    log "deleted the files of run $id (older than $RECORD_MAX_AGE_DAYS days, no instance listed)"
+  done < <(find "$RUNS_DIR" -maxdepth 1 -type f \( -name '*.json' -o -name '*.stop' -o -name '*.pid' \) \
+    -mtime +"$RECORD_MAX_AGE_DAYS" 2>/dev/null)
+}
+
 count_status() { # status -> number of instances with it
   local i c=0
   for i in "${!I_STATUS[@]}"; do [ "${I_STATUS[i]}" != "$1" ] || c=$((c + 1)); done
@@ -784,7 +1030,7 @@ sweep_run_names() {
       fi
     done
     if [ "$found" -eq 0 ] && ! has_uuid "$u"; then
-      I_NAME+=("$n") I_UUID+=("$u") I_SERIAL+=("") I_STATUS+=("START_FAILED") I_LIVE+=("")
+      I_NAME+=("$n") I_UUID+=("$u") I_SERIAL+=("") I_STATUS+=("START_FAILED") I_LIVE+=("") I_VSTOP+=(0) I_SEEN+=(1)
     fi
   done
 }
@@ -824,7 +1070,7 @@ start_instances() {
   for ((i = 0; i < COUNT; i++)); do
     check_stop_marker
     name="$PREFIX-$RUN_ID-$((i + 1))"
-    I_NAME+=("$name") I_UUID+=("") I_SERIAL+=("") I_STATUS+=("STARTING") I_LIVE+=("")
+    I_NAME+=("$name") I_UUID+=("") I_SERIAL+=("") I_STATUS+=("STARTING") I_LIVE+=("") I_VSTOP+=(0) I_SEEN+=(0)
     save_run "$(state_file "$RUN_ID")"
     STARTED_ANY=1
     GM_INDEX="$i"
@@ -860,10 +1106,16 @@ poll_boot() {
         u="${I_UUID[i]}"
         [ "${I_STATUS[i]}" = "STARTING" ] && [ -n "$u" ] || continue
         if ! is_alive "$u"; then
-          I_STATUS[i]="BOOT_FAILED"
-          log "${I_NAME[i]}: no longer listed (BOOT_FAILED)"
+          if [ "${I_SEEN[i]:-0}" = "1" ]; then
+            I_STATUS[i]="BOOT_FAILED"
+            log "${I_NAME[i]}: no longer listed (BOOT_FAILED)"
+          elif [ "${I_LIVE[i]}" != "NOT_LISTED" ]; then
+            I_LIVE[i]="NOT_LISTED"
+            log "${I_NAME[i]}: not listed yet"
+          fi
           continue
         fi
+        I_SEEN[i]=1
         st="${LIVE_STATE[$u]}"
         if [ "$st" != "${I_LIVE[i]}" ]; then log "${I_NAME[i]}: $st"; I_LIVE[i]="$st"; fi
         if [ "$st" = "ONLINE" ]; then
@@ -883,7 +1135,7 @@ poll_boot() {
   for i in "${!I_STATUS[@]}"; do
     if [ "${I_STATUS[i]}" = "STARTING" ]; then
       I_STATUS[i]="TIMEOUT"
-      log "${I_NAME[i]}: still starting after $BOOT_POLLS polls (TIMEOUT)"
+      log "${I_NAME[i]}: still starting, or still not listed, after $BOOT_POLLS polls (TIMEOUT)"
     fi
   done
 }
@@ -897,6 +1149,7 @@ connect_adb() {
       if [ "$port" -gt 65535 ]; then
         I_STATUS[i]="ADB_FAILED"; log "${I_NAME[i]}: no local port left below 65536 (ADB_FAILED)"; break
       fi
+      check_stop_marker
       gm instances adbconnect --adb-serial-port "$port" "${I_UUID[i]}"
       if [ "$GM_RC" -eq 0 ]; then
         serial="$(jq -r '.instance.adb_serial // empty' <<<"$GM_OUT")"
@@ -932,11 +1185,36 @@ connect_adb() {
   save_run "$(state_file "$RUN_ID")"
 }
 
+# "adb devices", run like the gmsaas calls (background + wait, so a signal is
+# handled at once), killed after ADB_DEVICES_TIMEOUT seconds: a hung adb then
+# counts as "no device listed". Its output is left in $WORK_DIR/adb.out; call it
+# directly, not in "$(...)": a subshell would delay the trap until it ends.
+adb_devices() {
+  local out="$WORK_DIR/adb.out"
+  : >"$out"
+  "$ADB_BIN" devices >"$out" 2>/dev/null </dev/null &
+  ADB_PID=$!
+  (
+    trap 'kill "$s" 2>/dev/null; exit 0' TERM
+    sleep "$ADB_DEVICES_TIMEOUT" & s=$!
+    wait "$s"
+    kill "$ADB_PID" 2>/dev/null
+  ) >/dev/null 2>&1 &
+  ADB_WD=$!
+  if ! wait "$ADB_PID"; then :; fi
+  ADB_PID=""
+  kill "$ADB_WD" 2>/dev/null || true
+  wait "$ADB_WD" 2>/dev/null || true
+  ADB_WD=""
+}
+
 verify_adb() {
   local a i out pending adb_started=0 retry_sleep
   retry_sleep=$(( POLL_INTERVAL < 2 ? POLL_INTERVAL : 2 ))
   for ((a = 1; a <= ADB_CHECKS; a++)); do
-    out="$("$ADB_BIN" devices 2>/dev/null)" || out=""
+    check_stop_marker
+    adb_devices
+    out="$(cat "$WORK_DIR/adb.out" 2>/dev/null)" || out=""
     pending=0
     for i in "${!I_NAME[@]}"; do
       [ "${I_STATUS[i]}" = "BOOTED" ] || continue
@@ -991,7 +1269,7 @@ finish_start() {
     if [ "${I_STATUS[i]}" != "ONLINE" ] && [ -n "${I_UUID[i]}" ]; then failed+=("${I_UUID[i]}"); fi
   done
   if ! stop_and_verify "${failed[@]}"; then
-    teardown_and_finish 5 "the stop of the failed instances could not be verified"
+    teardown_and_finish 5 "the stop of a failed instance could not be verified at first, so the whole run was stopped, healthy instances included"
   fi
   mark_stopped
   save_run "$(state_file "$RUN_ID")"
@@ -1005,9 +1283,14 @@ finish_start() {
     START_ACTIVE=0
     exit 0
   fi
-  log "error: the result could not be printed (standard output closed): stopping every instance of run $RUN_ID"
-  if teardown_run_all; then exit 5; fi
+  # Torn down here, once: on_exit must not do it again.
   START_ACTIVE=0
+  log "error: the result could not be printed (standard output closed): stopping every instance of run $RUN_ID"
+  if teardown_run_all; then
+    log "$(teardown_summary)"
+    exit 5
+  fi
+  log "$(not_verified_message)"
   exit 6
 }
 
@@ -1016,14 +1299,16 @@ cmd_start() {
   resolve_intervals
   prepare_runs_dir
   if ! live_list; then finish 3 "gmsaas failed: $GM_ERR_MSG"; fi
+  prune_old_records
   resolve_adb
   new_run_id
+  # The pid file comes first: a stop that finds the record also finds the start.
+  PID_FILE="$(pid_file "$RUN_ID")"
+  printf '%s\n%s\n' "$$" "$(proc_start_time "$$")" >"$PID_FILE" 2>/dev/null || config_error "cannot write $PID_FILE: the project directory must be writable"
   write_json_file "$(state_file "$RUN_ID")" "$(jq -n --arg run "$RUN_ID" --arg prefix "$PREFIX" \
     --arg recipe "$RECIPE" --argjson d "$DURATION" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{run_id: $run, created_at: $at, prefix: $prefix, recipe: $recipe, max_run_duration_minutes: $d, instances: []}')" ||
     config_error "cannot write $(state_file "$RUN_ID"): the project directory must be writable"
-  PID_FILE="$(pid_file "$RUN_ID")"
-  printf '%s\n%s\n' "$$" "$(proc_start_time "$$")" >"$PID_FILE" 2>/dev/null || config_error "cannot write $PID_FILE: the project directory must be writable"
   START_ACTIVE=1
   # Contract: the run id reaches standard error before any instance is started,
   # so a caller whose start is killed can still run "stop --run <run-id>".
@@ -1039,27 +1324,51 @@ cmd_start() {
 # ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
+# Appends the live instances named <any prefix>-<run-id>-<index> that no entry
+# carries yet (sorted by name). An entry with that name and no UUID takes it.
+add_run_names() { # run-id entry-run-tag
+  local n u i re="-${1}-[0-9]+\$"
+  while IFS= read -r n; do
+    [ -n "$n" ] && [[ "$n" =~ $re ]] || continue
+    u="${LIVE_BY_NAME[$n]}"
+    is_alive "$u" || continue
+    has_uuid "$u" && continue
+    for i in "${!I_NAME[@]}"; do
+      if [ "${I_NAME[i]}" = "$n" ] && [ -z "${I_UUID[i]}" ]; then I_UUID[i]="$u"; continue 2; fi
+    done
+    I_NAME+=("$n") I_UUID+=("$u") I_SERIAL+=("") I_STATUS+=("UNKNOWN") E_RUN+=("$2") I_VSTOP+=(0)
+  done < <(printf '%s\n' "${!LIVE_BY_NAME[@]}" | sort)
+}
+
 cmd_status() {
-  local i u st f
+  local i u st f have_record=1
   if [ -n "$F_RUN" ]; then check_run_flag "$F_RUN"; RUN_ID="$F_RUN"; else RUN_ID="$(latest_run_id)"; fi
   if [ -z "$RUN_ID" ]; then log "no recorded run in $RUNS_DIR"; finish 0; fi
   f="$(state_file "$RUN_ID")"
-  if ! load_run "$f"; then
-    finish 2 "the state file $f is unreadable or not a run record; run 'fanout.sh stop --run $RUN_ID' to stop the run by its instance names"
+  if [ ! -e "$f" ]; then
+    have_record=0
+  elif ! load_run "$f"; then
+    finish 2 "the run record $f is unreadable or not a run record; run 'fanout.sh stop --run $RUN_ID' to stop the run by its instance names"
   fi
   if ! live_list; then finish 3 "gmsaas failed: $GM_ERR_MSG"; fi
+  if [ "$have_record" -eq 0 ]; then
+    log "run $RUN_ID has no record in this directory: looking up its instances by name in the account"
+    add_run_names "$RUN_ID" ""
+    [ "${#I_NAME[@]}" -gt 0 ] ||
+      finish 2 "unknown run '$RUN_ID': no record in this directory, and no instance in the account carries this run id"
+  fi
   adopt_by_name || true
   for i in "${!I_NAME[@]}"; do
     u="${I_UUID[i]}"
     [ -n "$u" ] || continue
     if is_alive "$u"; then
       st="${LIVE_STATE[$u]}"
-      I_STATUS[i]="$st"
+      I_STATUS[i]="$(shown_state "$st")"
       if [ "$st" = "ONLINE" ] && [ -n "${LIVE_SERIAL[$u]}" ] && [ "${LIVE_SERIAL[$u]}" != "0.0.0.0" ]; then
         I_SERIAL[i]="${LIVE_SERIAL[$u]}"
       fi
-    elif ! is_failure_status "${I_STATUS[i]}"; then
-      I_STATUS[i]="STOPPED"
+    else
+      resolve_unlisted "$i"
     fi
   done
   finish 0
@@ -1069,18 +1378,29 @@ cmd_status() {
 # stop
 # ---------------------------------------------------------------------------
 cmd_stop() {
-  local f id u n i pid rc=0 k orig
+  local f id u n i pid rc=0 k orig rp no_record_run=""
   local -a run_ids=() targets=()
-  declare -A file_ok=()
+  declare -A file_ok=() no_write=() has_record=()
   resolve_intervals
   if [ "$F_ALL_MINE" -eq 1 ]; then
     check_config_file
     resolve_prefix ""
+    if ! live_list; then finish 3 "gmsaas failed: $GM_ERR_MSG"; fi
     if [ -d "$RUNS_DIR" ]; then
       for f in "$RUNS_DIR"/*.json; do
         [ -e "$f" ] || continue
         id="$(basename "$f" .json)"
-        if [[ "$id" =~ $RUN_ID_RE ]]; then run_ids+=("$id"); fi
+        [[ "$id" =~ $RUN_ID_RE ]] || continue
+        # Only the runs recorded with the configured prefix. An unreadable record
+        # is covered only by the name sweep of that prefix below.
+        valid_run_file "$f" || continue
+        rp="$(record_prefix "$f")"
+        [ "$rp" = "$PREFIX" ] || continue
+        # Already stopped: no running start, no entry in a non-final status,
+        # every entry with a UUID verified, and no listed instance with one of
+        # its names. Such a run gets no marker and no stop call.
+        if [ -z "$(active_start_pid "$id")" ] && run_fully_stopped "$f" && ! run_name_listed "$f"; then continue; fi
+        run_ids+=("$id")
       done
     fi
   else
@@ -1088,49 +1408,58 @@ cmd_stop() {
     if [ -z "$RUN_ID" ]; then log "no recorded run in $RUNS_DIR: nothing to stop"; finish 0; fi
     run_ids=("$RUN_ID")
   fi
+  for id in "${run_ids[@]}"; do
+    if [ -e "$(state_file "$id")" ]; then has_record["$id"]=1; else has_record["$id"]=0; fi
+  done
 
   # Ask a start still running for these runs to tear itself down, and wait for it:
-  # while start is active it is the only writer of the state file.
+  # while start is active it is the only writer of the run record.
   for id in "${run_ids[@]}"; do
+    [ "${has_record[$id]}" -eq 1 ] || continue
     : >"$(stop_marker "$id")" 2>/dev/null || log "cannot write $(stop_marker "$id")"
   done
   for id in "${run_ids[@]}"; do
     pid="$(active_start_pid "$id")"
     [ -n "$pid" ] || continue
-    log "start of run $id is still running (pid $pid): waiting for it to stop its instances"
+    log "start of run $id is still running (pid $pid): waiting for it to stop its instances (at most $ACTIVE_START_WAIT s)"
     for ((k = 0; k < ACTIVE_START_WAIT; k++)); do
       [ -n "$(active_start_pid "$id")" ] || break
       nap 1
     done
+    if [ -n "$(active_start_pid "$id")" ]; then
+      no_write["$id"]=1
+      log "warning: the start of run $id (pid $pid) is still running after $ACTIVE_START_WAIT s: stop goes on without it and leaves the run record to that start, which may still rewrite it"
+    fi
   done
 
   if ! live_list; then finish 3 "gmsaas failed: $GM_ERR_MSG"; fi
   for id in "${run_ids[@]}"; do
     f="$(state_file "$id")"
-    file_ok["$id"]=1
-    if ! load_run "$f" "$id"; then
-      file_ok["$id"]=0
-      log "the state file $f is unreadable or not a run record: stopping the run by its instance names"
+    file_ok["$id"]=0
+    if [ "${has_record[$id]}" -eq 0 ]; then
+      no_record_run="$id"
+      log "run $id has no record in this directory: stopping the instances that carry its run id in the account"
+      log "warning: a start of run $id still running in another directory cannot be reached from here; it may start more instances: run stop from the directory that holds its record"
+    elif load_run "$f" "$id"; then
+      file_ok["$id"]=1
+    else
+      log "the run record $f is unreadable or not a run record: stopping the run by its instance names"
     fi
     # Instances of the run by name: <any prefix>-<run-id>-<index>.
-    for n in "${!LIVE_BY_NAME[@]}"; do
-      [[ "$n" =~ -${id}-[0-9]+$ ]] || continue
-      u="${LIVE_BY_NAME[$n]}"
-      has_uuid "$u" && continue
-      for i in "${!I_NAME[@]}"; do
-        if [ "${I_NAME[i]}" = "$n" ] && [ -z "${I_UUID[i]}" ]; then I_UUID[i]="$u"; continue 2; fi
-      done
-      I_NAME+=("$n") I_UUID+=("$u") I_SERIAL+=("") I_STATUS+=("UNKNOWN") E_RUN+=("$id")
-    done
+    add_run_names "$id" "$id"
   done
+  if [ -n "$no_record_run" ] && [ "${#I_NAME[@]}" -eq 0 ]; then
+    finish 2 "unknown run '$no_record_run': no record in this directory, and no instance in the account carries this run id"
+  fi
   if [ "$F_ALL_MINE" -eq 1 ]; then
     # Unrecorded instances named <prefix>-<run-id>-<index>, whoever started them.
-    for n in "${!LIVE_BY_NAME[@]}"; do
-      [[ "$n" =~ ^${PREFIX}-[0-9]{14}-[0-9a-f]{8}-[0-9]+$ ]] || continue
+    while IFS= read -r n; do
+      [ -n "$n" ] && [[ "$n" =~ ^${PREFIX}-[0-9]{14}-[0-9a-f]{8}-[0-9]+$ ]] || continue
       u="${LIVE_BY_NAME[$n]}"
+      is_alive "$u" || continue
       has_uuid "$u" && continue
-      I_NAME+=("$n") I_UUID+=("$u") I_SERIAL+=("") I_STATUS+=("UNKNOWN") E_RUN+=("")
-    done
+      I_NAME+=("$n") I_UUID+=("$u") I_SERIAL+=("") I_STATUS+=("UNKNOWN") E_RUN+=("") I_VSTOP+=(0)
+    done < <(printf '%s\n' "${!LIVE_BY_NAME[@]}" | sort)
   fi
   for i in "${!I_UUID[@]}"; do [ -z "${I_UUID[i]}" ] || targets+=("${I_UUID[i]}"); done
 
@@ -1138,17 +1467,17 @@ cmd_stop() {
   mark_stopped
 
   for id in "${run_ids[@]}"; do
-    [ "${file_ok[$id]}" -eq 1 ] || continue
+    [ "${file_ok[$id]}" -eq 1 ] && [ -z "${no_write[$id]+x}" ] || continue
     f="$(state_file "$id")"
     orig="$(jq -c '.instances' "$f" 2>/dev/null)" || orig=""
-    if [ "$(instances_json "$id")" != "$orig" ]; then
+    if [ "$(record_json "$id")" != "$orig" ]; then
       save_run "$f" "$id" || log "cannot update $f"
     fi
   done
 
   [ "$F_ALL_MINE" -eq 0 ] || RUN_ID=""
   if [ "$rc" -ne 0 ]; then
-    finish 6 "${#STOP_REMAINING[@]} instance(s) still running after $STOP_POLLS checks: run stop again, then check https://cloud.geny.io/instances"
+    finish 6 "$(not_verified_message)"
   fi
   finish 0
 }
