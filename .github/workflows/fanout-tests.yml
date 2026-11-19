@@ -1,0 +1,33 @@
+name: fanout tests
+
+# Runs the offline checks of scripts/fanout.sh. The tests use the fake gmsaas
+# and adb of tests/fanout/fakes: no Genymotion instance is ever started.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  fanout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install ShellCheck 0.11.0
+        run: |
+          curl -sSL --fail -o "$RUNNER_TEMP/shellcheck.tar.xz" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  $RUNNER_TEMP/shellcheck.tar.xz" | sha256sum --check
+          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
+      - name: ShellCheck
+        run: |
+          "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" --version
+          "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" scripts/fanout.sh tests/fanout/run-tests.sh tests/fanout/fakes/gmsaas tests/fanout/fakes/adb
+      - name: Offline tests
+        run: tests/fanout/run-tests.sh
