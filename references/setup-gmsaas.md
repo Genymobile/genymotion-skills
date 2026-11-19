@@ -63,7 +63,7 @@ export GENYMOTION_API_TOKEN="your_token"
 # Windows (PowerShell) — environment variable (preferred):
 $env:GENYMOTION_API_TOKEN = "your_token"
 
-# CLI fallback (avoid — exposes token in shell history):
+# CLI fallback, for the user's own terminal only — never through a shell tool (exposes token in shell history):
 gmsaas auth token <your_token>
 ```
 
