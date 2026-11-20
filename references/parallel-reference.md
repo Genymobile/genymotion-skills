@@ -40,10 +40,10 @@ fanout.sh --help
 |---|---|
 | `start` | Starts `N` SaaS instances (default 1), waits until each is `ONLINE`, connects ADB on distinct ports, checks every serial with `adb devices`, prints the result. |
 | `status` | Prints the live state and the serial of each instance of a run. Without `--run`: the most recent run. |
-| `stop` | Stops every instance of a run, then verifies that none is still running. Without a flag: the most recent run recorded in this directory. With `--run <run-id>` and no record of that run in this directory, it finds the instances of the run by their names in the account; it cannot reach a `start` of that run that is still running in its own directory, and says so. |
+| `stop` | Stops every instance of a run, then verifies that none is still running. It sends its stop calls from the run record even when `gmsaas` cannot list the instances; it then exits 6, because nothing can be verified. It exits 0 only when its lookup of the run's instances by name ran on a list that succeeded. When a `start` was cut during a start call, it waits up to 40 seconds for that instance to appear. Without a flag: the most recent run recorded in this directory. With `--run <run-id>` and no record of that run in this directory, it finds the instances of the run by their names in the account; it cannot reach a `start` of that run that is still running in its own directory, and says so. |
 | `stop --all-mine` | Stops every run recorded here with the configured prefix, and every running instance named `<prefix>-<run-id>-<index>` for that prefix, then verifies. Runs of another prefix are left alone. |
 
-Always pass `--run <run_id>` to `stop`, with the `run_id` printed by `start`. Running `stop` again on a stopped run is safe and exits 0, from the directory that holds the record of the run.
+Always pass `--run <run_id>` to `stop`, with the `run_id` printed by `start`. Running `stop` again on a stopped run is safe and exits 0, from the directory that holds the record of the run and when `gmsaas` can list the instances.
 
 ### Settings
 
@@ -63,10 +63,11 @@ A flag overrides the environment variable, which overrides `.genymotion.json`, w
 - `start` refuses to run when the platform resolves to `desktop`. For an explicit SaaS request in such a project, set `GENYMOTION_PLATFORM=saas` on the call.
 - The script never asks a question. A missing recipe is a configuration error in every mode.
 
-Two environment variables tune the waiting time. They exist mainly for the tests:
+Three environment variables tune the waiting time. They exist mainly for the tests:
 
 - `GENYMOTION_POLL_INTERVAL`: seconds between two boot polls. Default 30. The script polls 10 times at most, as in `SKILL.md`.
 - `GENYMOTION_STOP_POLL_INTERVAL`: seconds between two stop checks. Default 10. The script checks 12 times at most.
+- `GENYMOTION_CALL_TIMEOUT`: time limit of one `gmsaas` call, in seconds, 1 to 3600. Default: 60, and 90 for `instances stop` and `instances adbconnect`.
 
 ### Output
 
@@ -109,10 +110,10 @@ After `start` returns, every instance that is not `ONLINE` has already been stop
 | 0 | success | `start`: at least `--min` instances are usable (read each `status`: some may have failed). `stop`: verified, nothing is running. `status`: printed. |
 | 1 | partial | `start`: some instances came up, but fewer than `--min`. Everything was stopped. |
 | 2 | configuration | Bad flag, missing or invalid setting, count above the cap, `jq` / `adb` / `gmsaas` not found, a project directory that cannot be written, (`status`) a run file that cannot be read, or (`stop --run`, `status --run`) a run id with no record here and no instance in the account. Nothing was started. |
-| 3 | gmsaas | `gmsaas` failed: not authenticated, Android SDK path not set, API or network error, or no instance could be created. Also for `stop` and `status`, when the instances cannot be listed. |
+| 3 | gmsaas | `gmsaas` failed: not authenticated, Android SDK path not set, API or network error, or no instance could be created. Also for `status`, and for `stop` when it has no run record to work from, when the instances cannot be listed. |
 | 4 | timeout | `start`: no instance was usable and at least one was still starting after the last poll. Everything was stopped. |
 | 5 | failed | `start`: no instance was usable (boot or ADB failures), the stop of a failed instance could not be verified at first, a `stop` was requested for this run, the result could not be printed, or the script hit an internal error. Everything was stopped, healthy instances included. |
-| 6 | stop incomplete | At least one instance is still running after `stop`. Run `stop` again, then check https://cloud.geny.io/instances. |
+| 6 | stop incomplete | At least one instance is not verified stopped, or the instances could not be listed. Run `stop` again, then check https://cloud.geny.io/instances. |
 | 129, 130, 143 | interrupted | `start` received a hang-up, Ctrl-C or a termination signal. It stopped everything it had started before exiting. |
 
 ### What `start` guarantees
@@ -125,6 +126,7 @@ After `start` returns, every instance that is not `ONLINE` has already been stop
 - A non-zero exit code from `start` means that every instance it created was stopped, except with code 6. The final `stop --run <run_id>` is still required: it also stops an instance whose start call failed and that was listed too late.
 - An instance that `gmsaas` does not list yet is not a failed one: `start` waits for it until the last poll.
 - A busy ADB port is skipped: the script tries the next port.
+- Every `gmsaas` and `adb` call has a time limit: a call that hangs is ended and counts as failed. The timeouts given above are for a `gmsaas` that answers; when its calls hang one after the other, a command takes much longer before it reports the failure (a stop call that hangs in every round costs about 20 minutes per instance). When your own timeout ends a `stop` first, run `stop --run <run-id>` again once `gmsaas` answers.
 - The API token is never printed or logged.
 
 `start` writes its run id on standard error before it starts any instance. If `start` ends without printing its JSON (killed, tool timeout), run `fanout.sh stop --run <run-id>` at once with that id. Use `stop` without a flag only when no other run is active in this directory: it stops the most recent run, which may belong to another agent. A process killed with `SIGKILL` cannot clean up by itself. `--max-run-duration` then limits the cost, but its countdown starts when the instance has booted, so it does not cover an instance that never boots: always run `stop`.
