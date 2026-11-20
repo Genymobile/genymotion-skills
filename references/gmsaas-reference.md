@@ -24,6 +24,7 @@ gmsaas config set android-sdk-path <path_to_sdk>
 
 ```bash
 # Via token (get one from https://cloud.geny.io/api)
+# For the user's own terminal only — never through a shell tool
 gmsaas auth token <your_token>
 
 # Via environment variable (no login command needed)
@@ -52,7 +53,7 @@ gmsaas --format json <command>             # For a single command
 
 | Option | Description |
 |--------|-------------|
-| `--format json` | JSON output for a command |
+| `--format json` | JSON output for a command (`text`, `json` or `compactjson`) |
 | `--help` / `-h` | Help for any command |
 
 ---
@@ -60,7 +61,7 @@ gmsaas --format json <command>             # For a single command
 ## Commands — Auth
 
 ```bash
-gmsaas auth token <token>   # Authenticate with an API token
+gmsaas auth token <token>   # For the user's own terminal only — never through a shell tool
 gmsaas auth reset            # Reset authentication
 ```
 
@@ -86,7 +87,8 @@ gmsaas instances list [-q]
 gmsaas instances get <instance_uuid>
 
 # Start an instance from a recipe
-gmsaas instances start <recipe_uuid> <name> [--no-wait] [--max-run-duration <seconds>]
+# --max-run-duration is in minutes (0 to 28800; 0 means no limit, never use it). Always set it.
+gmsaas instances start <recipe_uuid> <name> [--no-wait] [--max-run-duration <minutes>]
 
 # Stop an instance
 gmsaas instances stop <instance_uuid> [--no-wait]
@@ -177,27 +179,33 @@ gmsaas adb stop    # Stop the ADB daemon
 
 ## Common Workflows
 
+Before any `instances start`, `gmsaas doctor` must exit 0, and the start command needs a timeout of at least 6 minutes. Use a name that no listed instance has (`gmsaas instances list` first): a readable part and a `<unique-suffix>` (a UTC timestamp and a few random characters), or `<prefix>-<run-id>-1`. If a start exits non-zero or times out, follow "Starting a SaaS instance" in `SKILL.md`: find the instance by its name, stop it, verify.
+
 ### Start an instance and connect ADB
 
 ```bash
 # 1. Choose a recipe
 gmsaas recipes list
 
-# 2. Start the instance (always set a max duration to avoid unexpected charges)
-gmsaas instances start <recipe_uuid> "my-instance" --max-run-duration 3600
+# 2. Start the instance (always set a max duration, in minutes, to avoid unexpected charges)
+gmsaas instances start <recipe_uuid> "my-instance-<unique-suffix>" --max-run-duration 60
 
 # 3. Connect ADB
 gmsaas instances adbconnect <instance_uuid>
 
 # 4. Use ADB normally
 adb devices
+
+# 5. Stop the instance when done, then verify it is no longer listed
+gmsaas instances stop <instance_uuid>
+gmsaas instances list
 ```
 
 ### Run automated tests
 
 ```bash
-# 1. Start the instance (set duration to match your expected test time)
-gmsaas instances start <recipe_uuid> "test-device" --max-run-duration 3600
+# 1. Start the instance (set the duration, in minutes, to match your expected test time)
+gmsaas instances start <recipe_uuid> "test-device-<unique-suffix>" --max-run-duration 60
 
 # 2. Connect ADB
 gmsaas instances adbconnect <instance_uuid>
@@ -205,15 +213,16 @@ gmsaas instances adbconnect <instance_uuid>
 # 3. Run tests
 ./gradlew connectedAndroidTest
 
-# 4. Stop the instance after tests
+# 4. Stop the instance after tests, also when they fail, then verify it is no longer listed
 gmsaas instances stop <instance_uuid>
+gmsaas instances list
 ```
 
 ### Start an instance and display it
 
 ```bash
 # 1. Start the instance
-gmsaas instances start <recipe_uuid> "my-instance" --max-run-duration 3600
+gmsaas instances start <recipe_uuid> "my-instance-<unique-suffix>" --max-run-duration 60
 
 # 2. Get the instance UUID
 gmsaas instances list
@@ -221,6 +230,10 @@ gmsaas instances list
 # 3. Display (copies link to clipboard)
 gmsaas instances display <instance_uuid>
 # Or open directly: https://cloud.geny.io/instance/<instance_uuid>
+
+# 4. Stop the instance when done, then verify it is no longer listed
+gmsaas instances stop <instance_uuid>
+gmsaas instances list
 ```
 
 ### Save an instance as a new recipe
@@ -238,7 +251,7 @@ gmsaas instances saveas <instance_uuid> \
 | Situation | Action |
 |-----------|--------|
 | `gmsaas` not found | Check PATH or provide venv path (see SKILL.md) |
-| Auth error / 401 | `gmsaas auth token <token>` or check `GENYMOTION_API_TOKEN` |
+| Auth error / 401 | Ask the user to set `GENYMOTION_API_TOKEN` in their own terminal; never run `gmsaas auth token` through a shell tool. Non-interactive: stop with the Step 2b message of `SKILL.md` |
 | Unknown UUID | Run the corresponding `list` command and ask the user |
 | Instance already started/stopped | Inform the user of the current state |
 | `adb devices` empty after `adbconnect` | Run `gmsaas adb start` to start the local ADB daemon, then retry |

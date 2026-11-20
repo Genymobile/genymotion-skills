@@ -11,7 +11,10 @@ Use this workflow when the user asks to embed a Genymotion instance in a web pag
 ```
 1. Ensure the instance is running:
      gmsaas instances list
-   → If not started yet: gmsaas instances start <recipe_uuid> <name>
+   → If not started yet: gmsaas instances start <recipe_uuid> <name> --max-run-duration 60
+     (give the command a timeout of at least 6 minutes)
+     (minutes; use the configured value, see references/configuration.md;
+      on a failed or timed-out start, follow "Starting a SaaS instance" in SKILL.md)
 
 2. Get the WebRTC address — display this command for the user to run in their own terminal:
      curl -H 'Content-Type: application/json;charset=utf-8' \
@@ -41,6 +44,11 @@ Use this workflow when the user asks to embed a Genymotion instance in a web pag
      npx serve .
      # or
      python3 -m http.server 8080
+
+8. Remind to stop the instance when done to avoid charges:
+     gmsaas instances stop <instance_uuid>
+   When the user says they are done, or when the agent started the instance
+   for its own task: stop it and verify the stop (see SKILL.md)
 ```
 
 After generating the page, offer to customise:
