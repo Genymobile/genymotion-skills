@@ -18,7 +18,9 @@ The suite has been run on Linux only.
 ## How it stays offline
 
 - `fakes/gmsaas` and `fakes/adb` stand in for the real tools. The fake `gmsaas` keeps its instances in a temporary directory and logs every call.
-- The runner sets `PATH` to `tests/fanout/fakes`, then a directory holding a link to the bash that runs the suite, then `/usr/bin:/bin`. It aborts before the first test unless `gmsaas` and `adb` both resolve to the fakes.
+- The runner sets `PATH` to `tests/fanout/fakes`, then a directory holding a link to the bash that runs the suite, then `/usr/bin:/bin`.
+- Before the first test, and before every launch of the script, the runner resolves `gmsaas` and `adb` inside a child started exactly like the script (same `env -i` list, stdin from `/dev/null`). Unless both resolve to the fakes, it aborts the whole run.
+- Every launch of the script sets `HOME` to a temporary directory and reads stdin from `/dev/null`. Without `HOME`, and with a socket as stdin, bash reads the user's `~/.bashrc`, which can put the real `gmsaas` first on `PATH`.
 - Each test runs the script by its path, from its own temporary project directory, with a clean environment (`env -i`). Your own `GENYMOTION_*` variables and API token are not passed to the script.
 - Poll intervals are set to 0 in most tests, so they run in a fraction of a second.
 - The runner builds a temporary Android SDK whose `platform-tools/adb` is a link to the fake `adb`, and gives its path to the fake `gmsaas` (`FAKE_GMSAAS_SDK_PATH`). So, by default, the script uses the adb of the gmsaas Android SDK, as it does with a real configuration.
@@ -47,9 +49,12 @@ The fake `gmsaas` is driven by environment variables. The header of `fakes/gmsaa
 - `FAKE_GMSAAS_STOP_STATE_<index>=<state>`: once stopped, the instance is listed in that state (default `STOPPING`).
 - `FAKE_GMSAAS_HIDE_STOPPED_<index>=1`: once stopped, the instance is not listed while it stops; `instances get` still shows it, then answers 404.
 - `FAKE_GMSAAS_LIST_FAIL_AFTER=<n>`: every list call after the n-th fails with an API error 502 (exit 4).
+- `FAKE_GMSAAS_LIST_FAIL_AT=<n>`: exactly the n-th list call fails with an API error 502 (exit 4).
 - `FAKE_GMSAAS_STOP_UNAVAILABLE=1`, `FAKE_GMSAAS_GET_UNAVAILABLE=1`: every stop or get call fails with an API error 503 (exit 4).
 - `FAKE_GMSAAS_API_ERROR_MESSAGE=<message>`: the message of the three errors above, for example an HTML 404.
 - `FAKE_GMSAAS_LIST_DROP_<index>=<n>`: the instance is left out of every list call from the n-th on, while it still exists; `FAKE_GMSAAS_LIST_DROP_ONCE_<index>=<n>`: out of the n-th list call only.
+- `FAKE_GMSAAS_HANG="<command>"`: every call of that command (`instances stop`, ...) never answers; `FAKE_GMSAAS_HANG_LIST_AFTER=<n>`: every list call after the n-th never answers; `FAKE_GMSAAS_HANG_START_<index>=1`: the start call creates the instance, then never answers. A hung call is an `exec sleep`; its pid goes to `hang.pids`, and the runner ends what is left at exit.
+- `GENYMOTION_CALL_TIMEOUT=<s>` (read by the script, for the tests only): one time limit for every `gmsaas` call, instead of 60 s and 90 s.
 - `FAKE_GMSAAS_GET_DELETED_STATE=1`: `instances get` on an unknown or deleted UUID returns the state `DELETED` instead of a 404.
 - As in gmsaas 1.16.0, `instances get` and `instances stop` on an unknown or deleted UUID fail with an API error 404 (exit 4). API errors use the message shape `API returns unexpected code: <status>. Error: <text>`.
 - `FAKE_GMSAAS_LOCK_AFTER_LISTS=<n>:<dir>`: after the n-th list call, make `<dir>` read-only.

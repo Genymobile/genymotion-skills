@@ -46,6 +46,7 @@
 #   FAKE_GMSAAS_HIDE_STOPPED_<index>=1  once stopped, the instance is no longer listed while it is
 #                                    still stopping ("instances get" still shows it, then 404)
 #   FAKE_GMSAAS_LIST_FAIL_AFTER=N    every list call after the N-th fails: API error 502 (exit 4)
+#   FAKE_GMSAAS_LIST_FAIL_AT=N       exactly the N-th list call fails: API error 502 (exit 4)
 #   FAKE_GMSAAS_STOP_UNAVAILABLE=1   every stop call fails: API error 503 (exit 4)
 #   FAKE_GMSAAS_GET_UNAVAILABLE=1    every get call fails: API error 503 (exit 4)
 #   FAKE_GMSAAS_API_ERROR_MESSAGE=M  the message of the three errors above (default: their 502 / 503 text),
@@ -56,6 +57,10 @@
 #   FAKE_GMSAAS_LIST_DROP_ONCE_<index>=N  the instance is left out of the N-th list call only
 #   FAKE_GMSAAS_GET_DELETED_STATE=1  "instances get" on an unknown or deleted UUID returns the instance
 #                                    with state DELETED instead of a 404
+#   FAKE_GMSAAS_HANG="<command>"    every call of that command ("instances stop", ...) hangs
+#   FAKE_GMSAAS_HANG_LIST_AFTER=N    every list call after the N-th hangs
+#   FAKE_GMSAAS_HANG_START_<index>=1 the start call creates the instance, then hangs
+#   A hanging call is "exec sleep": killing the call leaves no process behind.
 # An unknown or deleted UUID gives, like gmsaas 1.16.0, an API error 404 (exit 4) on get and stop.
 # API errors use the gmsaas message shape "API returns unexpected code: <status>. Error: <text>".
 #   FAKE_GMSAAS_LOCK_AFTER_LISTS="<n>:<dir>"  after the n-th list call, chmod 555 <dir>
@@ -70,6 +75,11 @@ mkdir -p "$INST_DIR"
 printf '%s\n' "$*" >>"$FAKE_GMSAAS_DIR/calls.log"
 
 UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+hang() { # this call never answers; its pid is kept so the tests can end it
+  echo "$$" >>"$FAKE_GMSAAS_DIR/hang.pids"
+  exec sleep 3600
+}
 
 api_error() { # status text: gmsaas ApiError, exit 4
   fail 4 API_ERROR "API returns unexpected code: $1. Error: $2"
@@ -129,6 +139,8 @@ fi
 
 cmd="${1:-} ${2:-}"
 shift 2 || true
+
+if [ -n "${FAKE_GMSAAS_HANG:-}" ] && [ "$cmd" = "$FAKE_GMSAAS_HANG" ]; then hang; fi
 
 # gmsaas 1.16.0 (cli/checks.py, adb_tools_required): these commands need
 # <android-sdk-path>/platform-tools/adb (NoAndroidToolsError, exit 6).
@@ -209,6 +221,7 @@ case "$cmd" in
     else
       save "$INST_DIR/$uuid.json" "$inst"
     fi
+    if [ "$(knob FAKE_GMSAAS_HANG_START "$idx")" = "1" ]; then hang; fi
     delay="$(knob FAKE_GMSAAS_START_DELAY "$idx")"
     if [ -n "$delay" ]; then sleep "$delay"; fi
     if [ "$beh" = "startfail_created" ]; then fail 4 API_ERROR "Request timed out"; fi
@@ -221,6 +234,12 @@ case "$cmd" in
     fi
     nlist=$(( $(cat "$FAKE_GMSAAS_DIR/list_count" 2>/dev/null || echo 0) + 1 ))
     echo "$nlist" >"$FAKE_GMSAAS_DIR/list_count"
+    if [ -n "${FAKE_GMSAAS_HANG_LIST_AFTER:-}" ] && [ "$nlist" -gt "$FAKE_GMSAAS_HANG_LIST_AFTER" ]; then
+      hang
+    fi
+    if [ -n "${FAKE_GMSAAS_LIST_FAIL_AT:-}" ] && [ "$nlist" -eq "$FAKE_GMSAAS_LIST_FAIL_AT" ]; then
+      outage 502 "Bad Gateway"
+    fi
     if [ -n "${FAKE_GMSAAS_LIST_FAIL_AFTER:-}" ] && [ "$nlist" -gt "$FAKE_GMSAAS_LIST_FAIL_AFTER" ]; then
       outage 502 "Bad Gateway"
     fi

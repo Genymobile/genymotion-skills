@@ -34,6 +34,10 @@ readonly ADB_CHECKS=5           # "adb devices" checks at most
 readonly START_CALL_WAIT=40     # seconds a signal handler waits for an in-flight start call
 readonly ACTIVE_START_WAIT=240  # seconds "stop" waits for a running "start" of the same run
 readonly ADB_DEVICES_TIMEOUT=20 # seconds an "adb devices" check may take before it is killed
+# Time limits of the gmsaas calls. "instances stop" waits up to 30 s for the ADB
+# disconnect before its HTTP call; "instances adbconnect" has its own 60 s limit.
+readonly GMSAAS_CALL_LIMIT=60   # instances list|get|start, config get, adb start
+readonly GMSAAS_SLOW_CALL_LIMIT=90  # instances stop, instances adbconnect
 readonly RECORD_MAX_AGE_DAYS=30 # records of runs verified stopped are deleted after this
 readonly DEFAULT_DURATION=60    # minutes
 readonly DEFAULT_MAX_INSTANCES=5
@@ -46,6 +50,7 @@ readonly STARTING_STATES=" CREATING STARTING OFFLINE BOOTING UNKNOWN "
 # OFFLINE is also a starting state: a stop is re-issued for it (harmless).
 readonly LEAVING_STATES=" STOPPING STOPPED DELETING "
 readonly FAILURE_STATUSES=" START_FAILED BOOT_FAILED TIMEOUT ADB_FAILED "
+readonly FINAL_STATUSES=" STOPPED START_FAILED BOOT_FAILED TIMEOUT ADB_FAILED "
 readonly UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 readonly RUN_ID_RE='^[0-9]{14}-[0-9a-f]{8}$'
 readonly PREFIX_RE='^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$'
@@ -63,7 +68,9 @@ OUTPUT_DONE=0       # the one JSON object was printed (or its printing was attem
 START_ACTIVE=0      # a start is in progress: any abnormal exit must tear it down
 STARTED_ANY=0       # a start call was issued
 SLEEP_PID=""
-GM_PID="" GM_KIND="" GM_INDEX="" ADB_PID="" ADB_WD=""
+GM_PID="" GM_KIND="" GM_INDEX="" GM_WD="" ADB_PID="" ADB_WD=""
+GM_LIMIT_OVERRIDE=""  # GENYMOTION_CALL_TIMEOUT (tests only): one limit for every gmsaas call
+WD_PID=""
 WORK_DIR=""
 PID_FILE=""
 HAVE_JQ=0
@@ -77,6 +84,8 @@ GM_OUT="" GM_RC=0 GM_ERR_MSG=""
 I_NAME=() I_UUID=() I_SERIAL=() I_STATUS=() I_LIVE=() E_RUN=() I_VSTOP=() I_SEEN=()
 declare -A LIVE_STATE=() LIVE_SERIAL=() LIVE_BY_NAME=()
 LIVE_VALID=0        # the last live_list succeeded
+LOOKUP_DONE=0       # stop: the lookup of the runs' instances by name ran on a successful list
+STOP_CALLS_SENT=0   # stop calls sent in this invocation
 STOP_REMAINING=()
 declare -A STOP_TARGETS=()  # UUIDs handled by the last stop_and_verify
 declare -A STOP_GONE=()     # UUIDs the last stop_and_verify verified gone
@@ -204,29 +213,37 @@ settle_gm_call() {
   local k u
   if [ -n "$ADB_PID" ]; then kill "$ADB_PID" 2>/dev/null || true; ADB_PID=""; fi
   if [ -n "$ADB_WD" ]; then kill "$ADB_WD" 2>/dev/null || true; ADB_WD=""; fi
-  # A signal between the launch and "GM_PID=$!" leaves GM_PID empty: take the job.
-  if [ -z "$GM_PID" ] && [ "$GM_KIND" = "instances start" ]; then
-    GM_PID="$(jobs -p | tail -n 1)"
-  fi
-  [ -n "$GM_PID" ] || return 0
-  if [ "$GM_KIND" = "instances start" ]; then
-    log "waiting for the start call in flight to return (at most $START_CALL_WAIT s)"
-    for ((k = 0; k < START_CALL_WAIT; k++)); do
-      kill -0 "$GM_PID" 2>/dev/null || break
-      nap 1
-    done
-    kill "$GM_PID" 2>/dev/null || true
-    wait "$GM_PID" 2>/dev/null || true
-    u="$(jq -r '.instance.uuid // empty' "$WORK_DIR/gm.out" 2>/dev/null)" || u=""
-    if [ -n "$u" ] && [ -n "$GM_INDEX" ] && [ -z "${I_UUID[GM_INDEX]:-}" ]; then
-      I_UUID[GM_INDEX]="$u"
-      log "${I_NAME[GM_INDEX]}: started ($u)"
+  if [ "$GM_KIND" = "instances start" ] && [ -n "$GM_INDEX" ]; then
+    # A signal between the launch and "GM_PID=$!" leaves GM_PID empty: take the job.
+    if [ -z "$GM_PID" ] && [ -z "$(jq -r '.instance.uuid // empty' "$WORK_DIR/gm.out" 2>/dev/null)" ]; then
+      GM_PID="$(jobs -p | tail -n 1)"
     fi
-  else
-    kill "$GM_PID" 2>/dev/null || true
+    if [ -n "$GM_PID" ]; then
+      log "waiting for the start call in flight to return (at most $START_CALL_WAIT s)"
+      for ((k = 0; k < START_CALL_WAIT; k++)); do
+        kill -0 "$GM_PID" 2>/dev/null || break
+        nap 1
+      done
+      kill -KILL "$GM_PID" 2>/dev/null || true
+      wait "$GM_PID" 2>/dev/null || true
+    fi
+    u="$(jq -r '.instance.uuid // empty' "$WORK_DIR/gm.out" 2>/dev/null)" || u=""
+    if [ -z "${I_UUID[GM_INDEX]:-}" ]; then
+      if [ -n "$u" ]; then
+        I_UUID[GM_INDEX]="$u"
+        log "${I_NAME[GM_INDEX]}: started ($u)"
+      elif [ "${I_STATUS[GM_INDEX]:-}" = "STARTING" ]; then
+        # The cut start call gave no UUID: it may still have created an instance.
+        I_STATUS[GM_INDEX]="START_FAILED"
+        log "${I_NAME[GM_INDEX]}: the start call was cut and gave no instance UUID"
+      fi
+    fi
+  elif [ -n "$GM_PID" ]; then
+    kill -KILL "$GM_PID" 2>/dev/null || true
     wait "$GM_PID" 2>/dev/null || true
   fi
-  GM_PID="" GM_KIND="" GM_INDEX=""
+  stop_watchdog "$GM_WD"
+  GM_PID="" GM_KIND="" GM_INDEX="" GM_WD=""
 }
 
 # Tears the whole run down, then exits with CODE when every instance is verified
@@ -245,6 +262,16 @@ not_verified_message() {
   [ -n "$RUN_ID" ] || again="fanout.sh stop --all-mine"
   printf '%s instance(s) not verified stopped: run %s again, then check https://cloud.geny.io/instances' \
     "${#STOP_REMAINING[@]}" "'$again'"
+}
+
+# stop without a single successful list: exit 6 whatever the stop calls did.
+# The lookup by name never ran on a successful list: exit 6, saying what was done.
+no_list_message() {
+  local again="fanout.sh stop --run $RUN_ID" sent="no stop call was sent"
+  [ -n "$RUN_ID" ] || again="fanout.sh stop --all-mine"
+  [ "$STOP_CALLS_SENT" -eq 0 ] || sent="stop calls were sent from the run records"
+  printf "the instances could not be listed for the lookup by name (names not swept): %s, %s instance(s) not verified stopped, and no instance could be looked up by name: run '%s' again, then check https://cloud.geny.io/instances" \
+    "$sent" "${#STOP_REMAINING[@]}" "$again"
 }
 
 # What a verified teardown of the run proves.
@@ -363,6 +390,8 @@ Settings (flag > environment variable > .genymotion.json key > default):
   (no flag)           GENYMOTION_PLATFORM / platform (default: none). "start" refuses "desktop".
   (no flag)           GENYMOTION_POLL_INTERVAL (default: ${DEFAULT_POLL_INTERVAL} seconds). Between two boot polls, ${BOOT_POLLS} polls at most.
   (no flag)           GENYMOTION_STOP_POLL_INTERVAL (default: ${DEFAULT_STOP_POLL_INTERVAL} seconds). Between two stop checks, ${STOP_POLLS} checks at most.
+  (no flag)           GENYMOTION_CALL_TIMEOUT (default: ${GMSAAS_CALL_LIMIT} seconds, and ${GMSAAS_SLOW_CALL_LIMIT} for instances stop and instances adbconnect).
+                      Time limit of every gmsaas call, 1 to 3600 seconds. For tests.
   An empty environment variable, or an empty string in .genymotion.json, counts as not set.
   The API token is read by gmsaas itself.
 
@@ -383,13 +412,13 @@ Exit codes:
        (stop --run, status --run) a run id with no record here and no instance in the account;
        nothing was started
   3    gmsaas failed: not authenticated, Android SDK path not set, API or network error, or no instance
-       could be created; also for stop and status when the instances cannot be listed
+       could be created; also for status, and for stop without a run record, when the instances cannot be listed
   4    timeout: start: no instance usable and at least one still starting after the last poll;
        everything was stopped
   5    failed: start: no instance usable (boot or ADB failures), the stop of a failed instance could not
        be verified at first, a stop was requested for this run, the result could not be printed, or an
        internal error; everything was stopped, healthy instances included
-  6    stop incomplete: at least one instance is still running after stop; run stop again, then check
+  6    stop incomplete: at least one instance is not verified stopped, or the instances could not be listed; run stop again, then check
        https://cloud.geny.io/instances
   129, 130, 143  interrupted (hang-up, Ctrl-C, termination): start stopped everything it had started
   A non-zero exit code from start means that every instance it created was stopped, except 6.
@@ -496,6 +525,14 @@ See references/configuration.md for every setting.
 EOF
 }
 
+# Tests only: one time limit, in seconds, for every gmsaas call.
+resolve_call_limit() {
+  if [ -n "${GENYMOTION_CALL_TIMEOUT:-}" ]; then
+    in_range "$GENYMOTION_CALL_TIMEOUT" 1 3600 || config_error "GENYMOTION_CALL_TIMEOUT must be a whole number of seconds from 1 to 3600 (got '$GENYMOTION_CALL_TIMEOUT')"
+    GM_LIMIT_OVERRIDE="$GENYMOTION_CALL_TIMEOUT"
+  fi
+}
+
 resolve_intervals() {
   resolve "" GENYMOTION_POLL_INTERVAL "" "$DEFAULT_POLL_INTERVAL"
   in_range "$RV" 0 86400 || config_error "GENYMOTION_POLL_INTERVAL must be a whole number of seconds from 0 to 86400 (got '$RV')"
@@ -588,15 +625,34 @@ resolve_start_settings() {
 # ---------------------------------------------------------------------------
 # The call runs in the background and is waited for, so a signal reaches the
 # trap at once instead of after the call (which can take a minute).
+# Each call has a time limit (watchdog): on expiry the call is killed and counts
+# as a failed call, "gmsaas <command> did not answer within N s".
+# GM_KIND stays set after the call: start_instances clears it once the UUID of a
+# start call is stored, so a signal handler can still read it from the output.
 gm() {
-  local out="$WORK_DIR/gm.out" errf="$WORK_DIR/gm.err"
+  local out="$WORK_DIR/gm.out" errf="$WORK_DIR/gm.err" flag="$WORK_DIR/gm.timeout" limit
   GM_RC=0 GM_ERR_MSG="" GM_OUT=""
   GM_KIND="${1:-} ${2:-}"
+  case "$GM_KIND" in
+    "instances stop"|"instances adbconnect") limit="$GMSAAS_SLOW_CALL_LIMIT" ;;
+    *) limit="$GMSAAS_CALL_LIMIT" ;;
+  esac
+  [ -z "$GM_LIMIT_OVERRIDE" ] || limit="$GM_LIMIT_OVERRIDE"
+  rm -f "$flag" "$out" "$errf"
   gmsaas --format compactjson "$@" >"$out" 2>"$errf" </dev/null &
   GM_PID=$!
+  start_watchdog "$GM_PID" "$limit" "$flag"
+  GM_WD="$WD_PID"
   wait "$GM_PID" || GM_RC=$?
-  GM_PID="" GM_KIND=""
-  GM_OUT="$(cat "$out")" || GM_OUT=""
+  GM_PID=""
+  stop_watchdog "$GM_WD"
+  GM_WD=""
+  GM_OUT="$(cat "$out" 2>/dev/null)" || GM_OUT=""
+  if [ -e "$flag" ]; then
+    GM_RC=124
+    GM_ERR_MSG="gmsaas $GM_KIND did not answer within $limit s"
+    return 0
+  fi
   if [ "$GM_RC" -eq 0 ] && ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$GM_OUT"; then
     GM_RC=1
     GM_ERR_MSG="unexpected output from gmsaas (not a JSON object)"
@@ -638,6 +694,7 @@ is_alive() {
 is_failure_status() { [[ "$FAILURE_STATUSES" == *" $1 "* ]]; }
 
 stop_call() { # uuid
+  STOP_CALLS_SENT=$((STOP_CALLS_SENT + 1))
   gm instances stop --no-wait "$1"
   if [ "$GM_RC" -eq 0 ]; then log "stopping $1"; else log "stop $1: $GM_ERR_MSG"; fi
 }
@@ -1041,6 +1098,10 @@ teardown_run_all() {
   local i
   local -a targets=()
   if live_list; then sweep_run_names; fi
+  # An entry without a UUID that is still starting: its start call was cut.
+  for i in "${!I_NAME[@]}"; do
+    if [ -z "${I_UUID[i]}" ] && [[ "$FINAL_STATUSES" != *" ${I_STATUS[i]} "* ]]; then I_STATUS[i]="START_FAILED"; fi
+  done
   for i in "${!I_UUID[@]}"; do [ -z "${I_UUID[i]}" ] || targets+=("${I_UUID[i]}"); done
   local rc=0
   stop_and_verify "${targets[@]}" || rc=1
@@ -1075,7 +1136,6 @@ start_instances() {
     STARTED_ANY=1
     GM_INDEX="$i"
     gm instances start --no-wait --max-run-duration "$DURATION" "$RECIPE" "$name"
-    GM_INDEX=""
     uuid=""
     if [ "$GM_RC" -eq 0 ]; then uuid="$(jq -r '.instance.uuid // empty' <<<"$GM_OUT")"; fi
     if [ -n "$uuid" ]; then
@@ -1085,6 +1145,8 @@ start_instances() {
       I_STATUS[i]="START_FAILED"
       log "$name: start failed: ${GM_ERR_MSG:-no instance UUID in the gmsaas output}"
     fi
+    # Stored: a signal handler no longer needs the output of this call.
+    GM_KIND="" GM_INDEX=""
     save_run "$(state_file "$RUN_ID")"
   done
 }
@@ -1185,6 +1247,28 @@ connect_adb() {
   save_run "$(state_file "$RUN_ID")"
 }
 
+# Watchdog: after LIMIT seconds, writes FLAG and kills PID. It runs in the
+# background and is ended by stop_watchdog; its own sleep is killed with it, so
+# nothing is left behind. Sets WD_PID to the watchdog pid.
+# SIGKILL: during a teardown INT, TERM and HUP are ignored, and the calls it
+# makes inherit that, so a TERM would not end them.
+start_watchdog() { # pid limit flag
+  (
+    trap 'kill -KILL "$s" 2>/dev/null; exit 0' TERM
+    sleep "$2" & s=$!
+    wait "$s"
+    : >"$3"
+    kill -KILL "$1" 2>/dev/null
+  ) >/dev/null 2>&1 </dev/null &
+  WD_PID=$!
+}
+
+stop_watchdog() { # watchdog-pid
+  [ -n "$1" ] || return 0
+  kill "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+}
+
 # "adb devices", run like the gmsaas calls (background + wait, so a signal is
 # handled at once), killed after ADB_DEVICES_TIMEOUT seconds: a hung adb then
 # counts as "no device listed". Its output is left in $WORK_DIR/adb.out; call it
@@ -1194,17 +1278,11 @@ adb_devices() {
   : >"$out"
   "$ADB_BIN" devices >"$out" 2>/dev/null </dev/null &
   ADB_PID=$!
-  (
-    trap 'kill "$s" 2>/dev/null; exit 0' TERM
-    sleep "$ADB_DEVICES_TIMEOUT" & s=$!
-    wait "$s"
-    kill "$ADB_PID" 2>/dev/null
-  ) >/dev/null 2>&1 &
-  ADB_WD=$!
+  start_watchdog "$ADB_PID" "$ADB_DEVICES_TIMEOUT" "$WORK_DIR/adb.timeout"
+  ADB_WD="$WD_PID"
   if ! wait "$ADB_PID"; then :; fi
   ADB_PID=""
-  kill "$ADB_WD" 2>/dev/null || true
-  wait "$ADB_WD" 2>/dev/null || true
+  stop_watchdog "$ADB_WD"
   ADB_WD=""
 }
 
@@ -1324,6 +1402,25 @@ cmd_start() {
 # ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
+# stop: the lookup of the runs' instances by name, on the last list (which must
+# have succeeded): <any prefix>-<run-id>-<index> for each run, and, with
+# --all-mine, <prefix>-<run-id>-<index> for every run id. Sets LOOKUP_DONE.
+stop_name_lookup() { # run-id...
+  local id n u
+  for id in "$@"; do add_run_names "$id" "$id"; done
+  if [ "$F_ALL_MINE" -eq 1 ]; then
+    # Unrecorded instances named <prefix>-<run-id>-<index>, whoever started them.
+    while IFS= read -r n; do
+      [ -n "$n" ] && [[ "$n" =~ ^${PREFIX}-[0-9]{14}-[0-9a-f]{8}-[0-9]+$ ]] || continue
+      u="${LIVE_BY_NAME[$n]}"
+      is_alive "$u" || continue
+      has_uuid "$u" && continue
+      I_NAME+=("$n") I_UUID+=("$u") I_SERIAL+=("") I_STATUS+=("UNKNOWN") E_RUN+=("") I_VSTOP+=(0)
+    done < <(printf '%s\n' "${!LIVE_BY_NAME[@]}" | sort)
+  fi
+  LOOKUP_DONE=1
+}
+
 # Appends the live instances named <any prefix>-<run-id>-<index> that no entry
 # carries yet (sorted by name). An entry with that name and no UUID takes it.
 add_run_names() { # run-id entry-run-tag
@@ -1378,14 +1475,17 @@ cmd_status() {
 # stop
 # ---------------------------------------------------------------------------
 cmd_stop() {
-  local f id u n i pid rc=0 k orig rp no_record_run=""
-  local -a run_ids=() targets=()
+  local f id u n i pid rc=0 k orig rp no_record_run="" list_ok=1 t0=$SECONDS
+  local -a run_ids=() targets=() cut=() still_cut=() found=() not_verified=()
   declare -A file_ok=() no_write=() has_record=()
   resolve_intervals
   if [ "$F_ALL_MINE" -eq 1 ]; then
     check_config_file
     resolve_prefix ""
-    if ! live_list; then finish 3 "gmsaas failed: $GM_ERR_MSG"; fi
+    if ! live_list; then
+      list_ok=0
+      log "cannot list instances ($GM_ERR_MSG): stopping the runs recorded here only, without the name sweep"
+    fi
     if [ -d "$RUNS_DIR" ]; then
       for f in "$RUNS_DIR"/*.json; do
         [ -e "$f" ] || continue
@@ -1399,7 +1499,9 @@ cmd_stop() {
         # Already stopped: no running start, no entry in a non-final status,
         # every entry with a UUID verified, and no listed instance with one of
         # its names. Such a run gets no marker and no stop call.
-        if [ -z "$(active_start_pid "$id")" ] && run_fully_stopped "$f" && ! run_name_listed "$f"; then continue; fi
+        # Without a list the names cannot be checked: the verified stops decide.
+        if [ -z "$(active_start_pid "$id")" ] && run_fully_stopped "$f" &&
+          { [ "$list_ok" -eq 0 ] || ! run_name_listed "$f"; }; then continue; fi
         run_ids+=("$id")
       done
     fi
@@ -1432,10 +1534,19 @@ cmd_stop() {
     fi
   done
 
-  if ! live_list; then finish 3 "gmsaas failed: $GM_ERR_MSG"; fi
+  # The run records first: with a record, stop sends its stop calls even when
+  # gmsaas cannot list the instances (then nothing can be verified: exit 6).
+  list_ok=1
+  if ! live_list; then
+    list_ok=0
+    log "cannot list instances ($GM_ERR_MSG): stopping by the UUIDs of the run records"
+  fi
   for id in "${run_ids[@]}"; do
     f="$(state_file "$id")"
     file_ok["$id"]=0
+    if [ "${has_record[$id]}" -eq 0 ] && [ "$list_ok" -eq 0 ]; then
+      finish 3 "gmsaas failed: $GM_ERR_MSG; run $id has no record in this directory, so stop needs the instance list"
+    fi
     if [ "${has_record[$id]}" -eq 0 ]; then
       no_record_run="$id"
       log "run $id has no record in this directory: stopping the instances that carry its run id in the account"
@@ -1445,26 +1556,79 @@ cmd_stop() {
     else
       log "the run record $f is unreadable or not a run record: stopping the run by its instance names"
     fi
-    # Instances of the run by name: <any prefix>-<run-id>-<index>.
-    add_run_names "$id" "$id"
   done
+  # Instances of the runs by name, on this list when it succeeded.
+  [ "$list_ok" -eq 0 ] || stop_name_lookup "${run_ids[@]}"
   if [ -n "$no_record_run" ] && [ "${#I_NAME[@]}" -eq 0 ]; then
     finish 2 "unknown run '$no_record_run': no record in this directory, and no instance in the account carries this run id"
-  fi
-  if [ "$F_ALL_MINE" -eq 1 ]; then
-    # Unrecorded instances named <prefix>-<run-id>-<index>, whoever started them.
-    while IFS= read -r n; do
-      [ -n "$n" ] && [[ "$n" =~ ^${PREFIX}-[0-9]{14}-[0-9a-f]{8}-[0-9]+$ ]] || continue
-      u="${LIVE_BY_NAME[$n]}"
-      is_alive "$u" || continue
-      has_uuid "$u" && continue
-      I_NAME+=("$n") I_UUID+=("$u") I_SERIAL+=("") I_STATUS+=("UNKNOWN") E_RUN+=("") I_VSTOP+=(0)
-    done < <(printf '%s\n' "${!LIVE_BY_NAME[@]}" | sort)
   fi
   for i in "${!I_UUID[@]}"; do [ -z "${I_UUID[i]}" ] || targets+=("${I_UUID[i]}"); done
 
   stop_and_verify "${targets[@]}" || rc=1
   mark_stopped
+  # Every target not verified in this invocation (stop_and_verify is called again below).
+  not_verified=(${STOP_REMAINING[@]+"${STOP_REMAINING[@]}"})
+
+  # The list meant for the lookup by name failed: run the lookup on the last
+  # list of the rounds when it succeeded, else on one more list; then stop and
+  # verify what it finds.
+  if [ "$LOOKUP_DONE" -eq 0 ]; then
+    if [ "$LIVE_VALID" -eq 1 ] || live_list; then
+      log "looking up the instances of the run by name on a later list"
+      stop_name_lookup "${run_ids[@]}"
+      found=()
+      for i in "${!I_UUID[@]}"; do
+        u="${I_UUID[i]}"
+        # Only the UUIDs this lookup added (the first stop_and_verify had the others).
+        if [ -n "$u" ] && [ -z "${STOP_TARGETS[$u]+x}" ] && [ -z "${KNOWN_GONE[$u]+x}" ]; then
+          found+=("$u")
+        fi
+      done
+      if [ "${#found[@]}" -gt 0 ]; then
+        stop_and_verify "${found[@]}" || rc=1
+        mark_stopped
+        not_verified+=(${STOP_REMAINING[@]+"${STOP_REMAINING[@]}"})
+      fi
+    fi
+  fi
+
+  # A recorded name without a UUID, still starting: a start call was cut. Look
+  # for that name in the list for START_CALL_WAIT seconds from the beginning of
+  # this stop; adopt, stop and verify it when it appears.
+  for i in "${!I_NAME[@]}"; do
+    if [ -z "${I_UUID[i]}" ] && [ -n "${I_NAME[i]}" ] && [[ "$FINAL_STATUSES" != *" ${I_STATUS[i]} "* ]]; then cut+=("$i"); fi
+  done
+  if [ "${#cut[@]}" -gt 0 ]; then
+    log "${#cut[@]} start call(s) of the run were cut: looking for their instances for up to $START_CALL_WAIT s"
+  fi
+  while [ "${#cut[@]}" -gt 0 ]; do
+    found=() still_cut=()
+    if live_list; then
+      for i in "${cut[@]}"; do
+        n="${I_NAME[i]}"
+        if [ -n "${LIVE_BY_NAME[$n]+x}" ] && is_alive "${LIVE_BY_NAME[$n]}"; then
+          I_UUID[i]="${LIVE_BY_NAME[$n]}"
+          log "$n: found in the instance list by its name (${I_UUID[i]})"
+          found+=("${I_UUID[i]}")
+        else
+          still_cut+=("$i")
+        fi
+      done
+      cut=("${still_cut[@]}")
+    fi
+    if [ "${#found[@]}" -gt 0 ]; then
+      stop_and_verify "${found[@]}" || rc=1
+      mark_stopped
+      not_verified+=(${STOP_REMAINING[@]+"${STOP_REMAINING[@]}"})
+    fi
+    [ "${#cut[@]}" -gt 0 ] || break
+    [ $((SECONDS - t0)) -lt "$START_CALL_WAIT" ] || break
+    nap 1
+  done
+  for i in "${cut[@]}"; do
+    I_STATUS[i]="START_FAILED"
+    log "warning: ${I_NAME[i]}: its start call failed and gmsaas did not list it, but the instance may still appear: run 'fanout.sh stop --run ${E_RUN[i]:-$RUN_ID}' when you are done"
+  done
 
   for id in "${run_ids[@]}"; do
     [ "${file_ok[$id]}" -eq 1 ] && [ -z "${no_write[$id]+x}" ] || continue
@@ -1475,7 +1639,21 @@ cmd_stop() {
     fi
   done
 
+  if [ "$LOOKUP_DONE" -eq 0 ]; then
+    # The lookup by name never ran on a successful list: a failed start call
+    # without a UUID may have left an instance this stop cannot see.
+    for i in "${!I_NAME[@]}"; do
+      if [ -z "${I_UUID[i]}" ] && [ "${I_STATUS[i]}" = "START_FAILED" ]; then
+        log "warning: ${I_NAME[i]}: its start call failed and gmsaas could not be listed, so the instance may still exist: run 'fanout.sh stop --run ${E_RUN[i]:-$RUN_ID}' again"
+      fi
+    done
+  fi
+
   [ "$F_ALL_MINE" -eq 0 ] || RUN_ID=""
+  STOP_REMAINING=(${not_verified[@]+"${not_verified[@]}"})
+  if [ "$LOOKUP_DONE" -eq 0 ]; then
+    finish 6 "$(no_list_message)"
+  fi
   if [ "$rc" -ne 0 ]; then
     finish 6 "$(not_verified_message)"
   fi
@@ -1537,6 +1715,7 @@ main() {
   if command -v jq >/dev/null 2>&1; then HAVE_JQ=1; fi
   parse_args "$@"
   require_tools
+  resolve_call_limit
   case "$CMD" in
     start) cmd_start ;;
     status) cmd_status ;;

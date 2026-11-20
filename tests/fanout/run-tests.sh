@@ -19,7 +19,18 @@ FILTER="${1:-}"
 
 TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/fanout-tests.XXXXXX")"
 # Cleanup only; no assertion here. Some tests make directories read-only.
-trap 'chmod -R u+w "$TMPROOT" 2>/dev/null; rm -rf "$TMPROOT"' EXIT
+# Cleanup only, no assertion: end the hung fake calls the tests left, then delete.
+# shellcheck disable=SC2329 # invoked by the EXIT trap below
+cleanup() {
+  local f p
+  for f in "$TMPROOT"/*/.fake-gmsaas/hang.pids; do
+    [ -e "$f" ] || continue
+    while IFS= read -r p; do kill -KILL "$p" 2>/dev/null; done <"$f"
+  done
+  chmod -R u+w "$TMPROOT" 2>/dev/null
+  rm -rf "$TMPROOT"
+}
+trap cleanup EXIT
 # The script needs Bash 4.4+: put the bash running this suite first in line
 # (on macOS /bin/bash is 3.2).
 mkdir -p "$TMPROOT/bashbin"
@@ -39,16 +50,26 @@ TOKEN_SENTINEL="tok-SENTINEL-7f3a9c41-never-print-me"
 # --- Safety guard: never reach the real gmsaas or adb -----------------------
 export PATH="$SAFE_PATH"
 unset GENYMOTION_API_TOKEN
+RUNNER_PID=$$
+# guard: resolve gmsaas and adb inside a child started exactly like the script
+# under test (env -i, the same environment list, stdin from /dev/null), so that
+# anything a shell profile adds to PATH is seen. Any other answer than the fakes
+# aborts the whole runner, from whichever test it is called.
 guard() {
-  local g a
-  g="$(PATH="$SAFE_PATH" command -v gmsaas || true)"
-  a="$(PATH="$SAFE_PATH" command -v adb || true)"
+  local -a l
+  local res g a
+  mapfile -t l < <(base_env)
+  res="$(env -i "${l[@]}" ${ENVX[@]+"${ENVX[@]}"} bash -c \
+    'command -v gmsaas || echo; command -v adb || echo' </dev/null 2>/dev/null)" || res=""
+  g="$(sed -n 1p <<<"$res")"
+  a="$(sed -n 2p <<<"$res")"
   if [ "$g" != "$FAKES/gmsaas" ] || [ "$a" != "$FAKES/adb" ]; then
-    echo "ABORT: gmsaas resolves to '$g' and adb to '$a'; both must be the fakes in $FAKES" >&2
+    echo "ABORT: in the test environment gmsaas resolves to '$g' and adb to '$a'; both must be the fakes in $FAKES" >&2
+    # From a test subshell, end the runner itself too.
+    if [ "$BASHPID" != "$RUNNER_PID" ]; then kill -TERM "$RUNNER_PID" 2>/dev/null; fi
     exit 2
   fi
 }
-guard
 if ! command -v jq >/dev/null 2>&1; then echo "ABORT: jq is required by the tests" >&2; exit 2; fi
 if [ ! -f "$SCRIPT" ]; then echo "ABORT: $SCRIPT not found" >&2; exit 2; fi
 
@@ -86,8 +107,8 @@ calls_clean() {
 
 # fan ARGS...: run the script by path with the clean environment plus ENVX.
 fan() {
-  guard
   local -a env_list
+  guard
   mapfile -t env_list < <(base_env)
   RC=0
   (cd "${FAN_DIR:-$PROJ}" && env -i "${env_list[@]}" ${ENVX[@]+"${ENVX[@]}"} "$SCRIPT" "$@") \
@@ -155,12 +176,17 @@ run_id_from() { # stderr file -> the run id of the "fanout: run <id> (stop it wi
   sed -n 's/^fanout: run \([0-9]\{14\}-[0-9a-f]\{8\}\) (stop it with: fanout\.sh stop --run \1)$/\1/p' "$1" | head -n 1
 }
 fake_start() { # name: start an instance directly in the fake, outside the script
-  env -i "PATH=$SAFE_PATH" "FAKE_GMSAAS_DIR=$FAKE" gmsaas --format compactjson instances start --no-wait "$RECIPE_A" "$1" >/dev/null
+  env -i "PATH=$SAFE_PATH" "HOME=$PROJ" "FAKE_GMSAAS_DIR=$FAKE" gmsaas --format compactjson instances start --no-wait "$RECIPE_A" "$1" >/dev/null </dev/null
 }
 fake_has_name() { some_file_has "\"name\":\"$1\"" "$FAKE/instances"; }
 contains() { [[ "$1" == *"$2"* ]]; }             # contains TEXT PART
 no_file_has() { ! grep -rqF -- "$1" "$2" 2>/dev/null; }   # no_file_has TEXT PATH
 some_file_has() { grep -rqF -- "$1" "$2" 2>/dev/null; }   # some_file_has TEXT PATH
+
+# The first check, before any test, in a throw-away project directory.
+PROJ="$TMPROOT/guard" FAKE="$TMPROOT/guard/.fake-gmsaas" ENVX=()
+mkdir -p "$PROJ/.tmp"
+guard
 
 # --- Tests ---------------------------------------------------------------------
 
@@ -1632,6 +1658,243 @@ t_old_format_record() {
   fake_none || fail "no instance left (got $(fake_count))"
 }
 
+# Ends the hung fake calls of this test (their pids are in hang.pids).
+end_hung_calls() {
+  local p
+  [ -e "$FAKE/hang.pids" ] || return 0
+  while IFS= read -r p; do kill -KILL "$p" 2>/dev/null; done <"$FAKE/hang.pids"
+}
+
+# No hung fake call is still alive.
+no_hung_call_alive() {
+  local p
+  [ -e "$FAKE/hang.pids" ] || return 0
+  while IFS= read -r p; do if kill -0 "$p" 2>/dev/null; then return 1; fi; done <"$FAKE/hang.pids"
+  return 0
+}
+
+# Waits (bounded, seconds) for the background script; fails and kills it when late.
+bg_wait_within() { # seconds
+  local i
+  for ((i = 0; i < $1 * 10; i++)); do kill -0 "$BG_PID" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$BG_PID" 2>/dev/null; then
+    fail "the script ended within $1 s"
+    kill -KILL "$BG_PID" 2>/dev/null
+  fi
+  bg_wait
+}
+
+# stop right after a start killed during a start call: the instance of that
+# call, created a moment later, is found by its recorded name and stopped.
+t_stop_right_after_sigkill_in_start_call() {
+  local run
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_CREATE_DELAY_2=3")
+  bg_start start --count 2
+  wait_calls_at_least ' instances start ' 2 || fail "start call 2 in flight"
+  kill -KILL "$BG_PID"
+  bg_wait
+  run="$(run_id_from "$BG_ERR")"
+  ENVX=()
+  fan stop --run "$run"
+  rc_is 0 || fail "stop exit 0 (got $RC)"
+  fake_none || fail "no instance left when stop returns (got $(fake_count))"
+  ! grep -q STARTING "$OUT" || fail "the result never contains STARTING"
+  jt '.instances[1].status == "STOPPED" and .instances[1].uuid != null' || fail "instance 2 adopted and stopped"
+}
+
+# A cut start call whose instance never appears: after 40 s, START_FAILED and
+# the warning; the exit code is unchanged. (About 40 s.)
+t_stop_cut_start_call_never_listed() {
+  local run t0
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_HANG=instances start")
+  bg_start start --count 1
+  wait_calls_at_least ' instances start ' 1 || fail "start call in flight"
+  kill -KILL "$BG_PID"
+  bg_wait
+  end_hung_calls
+  run="$(run_id_from "$BG_ERR")"
+  ENVX=()
+  t0=$SECONDS
+  fan stop --run "$run"
+  rc_is 0 || fail "stop exit 0 (got $RC)"
+  [ $((SECONDS - t0)) -ge 39 ] || fail "stop looked for the instance for 40 s ($((SECONDS - t0)) s)"
+  jt '.instances[0].status == "START_FAILED"' || fail "the cut entry becomes START_FAILED"
+  err_has "warning: agent-$run-1: its start call failed" || fail "the warning is printed"
+  ! grep -q STARTING "$OUT" || fail "the result never contains STARTING"
+}
+
+# The very first list of stop fails: the stop calls are still sent from the
+# record; nothing can be verified: exit 6, UNVERIFIED. Without a record: exit 3.
+t_stop_when_first_list_fails() {
+  local run lc other="$PROJ/.elsewhere"
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 2
+  run="$(j .run_id)"
+  lc="$(cat "$FAKE/list_count")"
+  reset_logs
+  ENVX=("FAKE_GMSAAS_LIST_FAIL_AFTER=$lc")
+  fan stop --run "$run"
+  rc_is 6 || fail "exit 6 (got $RC)"
+  [ "$(stop_calls)" -ge 2 ] || fail "a stop call for each recorded instance (got $(stop_calls))"
+  jt '[.instances[].status] == ["UNVERIFIED","UNVERIFIED"]' || fail "both UNVERIFIED (got: $(j -c '[.instances[].status]'))"
+  jt '.error | test("could not be listed")' || fail "the error says the instances could not be listed"
+  jt '.error | test("stop calls were sent from the run records")' || fail "the error says the stop calls were sent"
+  mkdir -p "$other"
+  FAN_DIR="$other" fan stop --run "$run"
+  rc_is 3 || fail "no record here and no list: exit 3 (got $RC)"
+}
+
+# start interrupted during a start call that returns no UUID: the entry becomes
+# START_FAILED, the warning is printed, no false "every instance was stopped".
+t_interrupt_cut_start_call_no_uuid() {
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_BEHAVIOUR_2=startfail_created"
+        "FAKE_GMSAAS_START_DELAY_2=2" "FAKE_GMSAAS_HIDE_LISTS_2=30")
+  bg_start start --count 3
+  wait_fake_at_least 2 || fail "instance 2 created"
+  kill -TERM "$BG_PID"
+  bg_wait
+  rc_is 143 || fail "exit 143 (got $RC)"
+  jq -e '.instances[1].status == "START_FAILED"' "$BG_OUT" >/dev/null 2>&1 || fail "entry 2 START_FAILED"
+  ! grep -q STARTING "$BG_OUT" || fail "the result never contains STARTING"
+  ! grep -q 'every instance of the run was stopped' "$BG_OUT" || fail "no false claim"
+  grep -q "warning: agent-.*-2: its start call failed" "$BG_ERR" || fail "the warning is printed"
+}
+
+# A stop call that never answers: ended after its time limit, sent again in
+# the next round; stop ends within its rounds with exit 6, no process left.
+t_hanging_stop_call() {
+  local run
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  run="$(j .run_id)"
+  ENVX=("GENYMOTION_CALL_TIMEOUT=1" "FAKE_GMSAAS_HANG=instances stop")
+  bg_start stop --run "$run"
+  bg_wait_within 60
+  rc_is 6 || fail "exit 6 (got $RC)"
+  grep -q 'did not answer within 1 s' "$BG_ERR" || fail "the time limit is reported"
+  no_hung_call_alive || fail "no hung call left"
+  end_hung_calls
+}
+
+# A list call that never answers during a start teardown does not block it.
+t_hanging_list_in_teardown() {
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "GENYMOTION_CALL_TIMEOUT=1" "FAKE_GMSAAS_BEHAVIOUR_1=slow"
+        "FAKE_GMSAAS_HANG_LIST_AFTER=11")
+  bg_start start --count 1
+  bg_wait_within 60
+  rc_is 6 || fail "exit 6: nothing could be verified (got $RC)"
+  no_hung_call_alive || fail "no hung call left"
+  end_hung_calls
+}
+
+# A start call that never answers: ended after its time limit, START_FAILED;
+# the others are not affected; its instance is found by name and stopped.
+t_hanging_start_call() {
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "GENYMOTION_CALL_TIMEOUT=2" "FAKE_GMSAAS_HANG_START_2=1")
+  bg_start start --count 3
+  bg_wait_within 60
+  rc_is 0 || fail "exit 0 (got $RC)"
+  jq -e '[.instances[].status] == ["ONLINE","START_FAILED","ONLINE"]' "$BG_OUT" >/dev/null 2>&1 ||
+    fail "only instance 2 START_FAILED (got: $(jq -c '[.instances[].status]' "$BG_OUT" 2>/dev/null))"
+  grep -q "gmsaas instances start did not answer within 2 s" "$BG_ERR" || fail "the time limit is reported"
+  [ "$(fake_count)" -eq 2 ] || fail "the instance of the hung call was stopped (got $(fake_count))"
+  no_hung_call_alive || fail "no hung call left"
+  end_hung_calls
+}
+
+# stop --all-mine when no list succeeds: the name sweep could not run, so the
+# unrecorded instance with the prefix is not stopped and the exit is 6, not 0.
+t_all_mine_without_any_list() {
+  local run lc
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  run="$(j .run_id)"
+  fan stop --run "$run"
+  rc_is 0 || fail "first stop exit 0 (got $RC)"
+  fake_start "agent-20200101000000-deadbeef-1"
+  lc="$(cat "$FAKE/list_count")"
+  ENVX=("FAKE_GMSAAS_LIST_FAIL_AFTER=$lc")
+  fan stop --all-mine
+  rc_is 6 || fail "exit 6 (got $RC)"
+  jt '.error | test("names not swept")' || fail "the error says the names were not swept"
+  jt '.error | test("no stop call was sent")' || fail "the error says no stop call was sent"
+}
+
+# stop --run when no list succeeds and the record holds a failed start call
+# without UUID: exit 6 and the warning for that entry.
+t_stop_without_any_list_failed_start() {
+  local run lc
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_BEHAVIOUR_1=startfail_created" "FAKE_GMSAAS_HIDE_LISTS_1=100")
+  fan start --count 1
+  rc_is 3 || fail "start exit 3 (got $RC)"
+  run="$(j .run_id)"
+  jf '.instances[0].uuid == null and .instances[0].status == "START_FAILED"' "$(state_file "$run")" || fail "precondition: entry without UUID"
+  lc="$(cat "$FAKE/list_count")"
+  ENVX=("FAKE_GMSAAS_LIST_FAIL_AFTER=$lc")
+  fan stop --run "$run"
+  rc_is 6 || fail "exit 6 (got $RC)"
+  err_has "warning: agent-$run-1: its start call failed" || fail "the warning for the entry without UUID"
+  jt '.error | test("could not be listed")' || fail "the error says the instances could not be listed"
+}
+
+# The exit-6 count covers every target of the invocation, also when the lookup
+# of a cut start call verifies a second batch afterwards.
+t_exit6_counts_every_target() {
+  local run d="$PROJ/.genymotion/runs"
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_BEHAVIOUR_1=stuckstop")
+  fan start --count 1
+  run="$(j .run_id)"
+  jq --arg n "agent-$run-2" '.instances += [{name: $n, uuid: null, serial: null, status: "STARTING"}]' \
+    "$d/$run.json" >"$d/$run.new" && mv "$d/$run.new" "$d/$run.json"
+  # The cut start call: its instance appears 4 s later.
+  env -i "PATH=$SAFE_PATH" "HOME=$PROJ" "FAKE_GMSAAS_DIR=$FAKE" "FAKE_GMSAAS_CREATE_DELAY_2=4" \
+    gmsaas --format compactjson instances start --no-wait "$RECIPE_A" "agent-$run-2" >/dev/null 2>&1 </dev/null &
+  ENVX=()
+  fan stop --run "$run"
+  wait
+  rc_is 6 || fail "exit 6 (got $RC)"
+  jt '.error | test("^1 instance\\(s\\) not verified stopped")' || fail "the count is 1 (got: $(j .error))"
+  jt '.instances[1].status == "STOPPED"' || fail "the instance of the cut call was found and stopped"
+}
+
+# stop --all-mine whose lookup list (its second list) fails while the others
+# work: the lookup runs on a later list, and the stray instance is stopped.
+t_all_mine_lookup_list_fails() {
+  local run lc
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A")
+  fan start --count 1
+  run="$(j .run_id)"
+  fan stop --run "$run"
+  rc_is 0 || fail "first stop exit 0 (got $RC)"
+  fake_start "agent-20200101000000-deadbeef-1"
+  lc="$(cat "$FAKE/list_count")"
+  ENVX=("FAKE_GMSAAS_LIST_FAIL_AT=$((lc + 2))")
+  fan stop --all-mine
+  rc_is 0 || fail "exit 0 (got $RC)"
+  ! fake_has_name "agent-20200101000000-deadbeef-1" || fail "the stray instance was found by name and stopped"
+  jt '[.instances[] | select(.name == "agent-20200101000000-deadbeef-1") | .status] == ["STOPPED"]' ||
+    fail "the stray instance is reported STOPPED"
+}
+
+# stop --run whose first list fails, with a record entry of a failed start call
+# without UUID: the lookup runs on a later list, and that instance is stopped.
+t_stop_first_list_fails_late_instance() {
+  local run lc
+  ENVX=("GENYMOTION_SAAS_RECIPE=$RECIPE_A" "FAKE_GMSAAS_BEHAVIOUR_2=startfail_created" "FAKE_GMSAAS_HIDE_LISTS_2=6")
+  fan start --count 2
+  rc_is 0 || fail "start exit 0 (got $RC)"
+  run="$(j .run_id)"
+  jf '.instances[1].uuid == null and .instances[1].status == "START_FAILED"' "$(state_file "$run")" ||
+    fail "precondition: entry 2 without UUID"
+  [ "$(fake_count)" -eq 2 ] || fail "precondition: the fake holds the instance of the failed start call"
+  lc="$(cat "$FAKE/list_count")"
+  ENVX=("FAKE_GMSAAS_LIST_FAIL_AT=$((lc + 1))")
+  fan stop --run "$run"
+  rc_is 0 || fail "exit 0 (got $RC)"
+  fake_none || fail "no instance left (got $(fake_count))"
+  jf '[.instances[].stop_verified] == [true, true]' "$(state_file "$run")" || fail "both recorded as verified"
+}
+
 # --- Runner --------------------------------------------------------------------
 pass=0 failed=0 skipped=0
 failed_names=()
@@ -1733,6 +1996,18 @@ if selected t_stop_output_unverified; then (new_project; T_FAILED=0; t_stop_outp
 if selected t_all_mine_running_start_no_uuid_yet; then (new_project; T_FAILED=0; t_all_mine_running_start_no_uuid_yet; end_test $?); report t_all_mine_running_start_no_uuid_yet $?; fi
 if selected t_stale_pid_without_lstart; then (new_project; T_FAILED=0; t_stale_pid_without_lstart; end_test $?); report t_stale_pid_without_lstart $?; fi
 if selected t_old_format_record; then (new_project; T_FAILED=0; t_old_format_record; end_test $?); report t_old_format_record $?; fi
+if selected t_stop_right_after_sigkill_in_start_call; then (new_project; T_FAILED=0; t_stop_right_after_sigkill_in_start_call; end_test $?); report t_stop_right_after_sigkill_in_start_call $?; fi
+if selected t_stop_cut_start_call_never_listed; then (new_project; T_FAILED=0; t_stop_cut_start_call_never_listed; end_test $?); report t_stop_cut_start_call_never_listed $?; fi
+if selected t_stop_when_first_list_fails; then (new_project; T_FAILED=0; t_stop_when_first_list_fails; end_test $?); report t_stop_when_first_list_fails $?; fi
+if selected t_interrupt_cut_start_call_no_uuid; then (new_project; T_FAILED=0; t_interrupt_cut_start_call_no_uuid; end_test $?); report t_interrupt_cut_start_call_no_uuid $?; fi
+if selected t_hanging_stop_call; then (new_project; T_FAILED=0; t_hanging_stop_call; end_test $?); report t_hanging_stop_call $?; fi
+if selected t_hanging_list_in_teardown; then (new_project; T_FAILED=0; t_hanging_list_in_teardown; end_test $?); report t_hanging_list_in_teardown $?; fi
+if selected t_hanging_start_call; then (new_project; T_FAILED=0; t_hanging_start_call; end_test $?); report t_hanging_start_call $?; fi
+if selected t_all_mine_without_any_list; then (new_project; T_FAILED=0; t_all_mine_without_any_list; end_test $?); report t_all_mine_without_any_list $?; fi
+if selected t_stop_without_any_list_failed_start; then (new_project; T_FAILED=0; t_stop_without_any_list_failed_start; end_test $?); report t_stop_without_any_list_failed_start $?; fi
+if selected t_exit6_counts_every_target; then (new_project; T_FAILED=0; t_exit6_counts_every_target; end_test $?); report t_exit6_counts_every_target $?; fi
+if selected t_all_mine_lookup_list_fails; then (new_project; T_FAILED=0; t_all_mine_lookup_list_fails; end_test $?); report t_all_mine_lookup_list_fails $?; fi
+if selected t_stop_first_list_fails_late_instance; then (new_project; T_FAILED=0; t_stop_first_list_fails_late_instance; end_test $?); report t_stop_first_list_fails_late_instance $?; fi
 
 echo "----"
 echo "$pass passed, $failed failed, $skipped skipped"
